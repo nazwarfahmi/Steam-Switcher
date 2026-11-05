@@ -1,0 +1,16 @@
+services:
+  steam-cloud-save:
+    image: python:3.12-alpine
+    container_name: steam-cloud-save
+    restart: unless-stopped
+    working_dir: /app
+    command: python /app/cloud_server.py
+    environment:
+      - PORT=8765
+      - DATA_DIR=/data/saves
+      - MAX_HISTORY=5
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./cloud_server.py:/app/cloud_server.py:ro
+      - ./saves_data:/data/saves

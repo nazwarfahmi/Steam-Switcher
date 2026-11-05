@@ -1,0 +1,1947 @@
+import os
+import io
+import sys
+import re
+import glob
+import json
+import time
+import struct
+import socket
+import base64
+import shutil
+import zipfile
+import hashlib
+import winreg
+import fnmatch
+import tempfile
+import threading
+import ctypes
+import urllib.parse
+import urllib.request
+import subprocess
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+PORT = 18420
+if getattr(sys, "frozen", False):
+    ASSET_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = ASSET_DIR
+
+APP_REG_PATH = r"Software\SteamSwitcher"
+DEFAULT_CLOUD_URL = ""
+MAX_SAVE_HISTORY = 5
+STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_REG_NAME = "SteamSwitcher"
+
+STATE_CACHE = None
+COVER_CACHE = {}
+COVER_B64_CACHE = {}
+UFS_CACHE = {}
+CACHE_LOCK = threading.Lock()
+ACTIVE_WATCHERS = set()
+LAUNCHING_UNTIL = {}
+UPLOADING_APPIDS = set()
+UPLOADING_UNTIL = {}
+LAST_UPLOAD_MSG = {}
+LAST_UI_ACTIVITY_TS = time.time()
+TRAY_ICON = None
+
+def _load_asset_bytes(filename):
+    for folder in (ASSET_DIR, BASE_DIR):
+        p = os.path.join(folder, filename)
+        if os.path.exists(p):
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except Exception:
+                pass
+    return b""
+
+LOGO_PNG_BYTES = _load_asset_bytes("logo.png")
+LOGO_ICO_BYTES = _load_asset_bytes("logo.ico")
+LOGO_B64_URI = (
+    "data:image/png;base64," + base64.b64encode(LOGO_PNG_BYTES).decode("ascii")
+    if LOGO_PNG_BYTES else "/logo.png"
+)
+
+NON_GAME_APPIDS = {
+    "228980",  # Steamworks Common Redistributables
+    "2371090", # Steam Game Notes
+    "241100",  # Steam Controller Configs
+    "250820",  # SteamVR
+    "769",     # Steamworks SDK
+    "1070560", # Steam Linux Runtime
+    "1391110", # Steam Linux Runtime - Soldier
+    "1628350", # Steam Linux Runtime - Sniper
+}
+
+def _reg_read_json(value_name):
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, APP_REG_PATH, 0, winreg.KEY_READ)
+        raw, _ = winreg.QueryValueEx(key, value_name)
+        winreg.CloseKey(key)
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    return None
+
+def _reg_write_json(value_name, data):
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, APP_REG_PATH)
+        winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, json.dumps(data))
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+def load_cloud_config():
+    default = {
+        "server_url": DEFAULT_CLOUD_URL,
+        "username": "",
+        "password": "",
+        "device_name": socket.gethostname() or "PC",
+        "auto_sync": True,
+        "enabled_appids": []
+    }
+    data = _reg_read_json("CloudConfig")
+    if isinstance(data, dict):
+        default.update(data)
+    if not default.get("server_url"):
+        default["server_url"] = DEFAULT_CLOUD_URL
+    if not isinstance(default.get("enabled_appids"), list):
+        default["enabled_appids"] = []
+    default["enabled_appids"] = [str(x) for x in default["enabled_appids"]]
+    return default
+
+def save_cloud_config(cfg):
+    try:
+        cur = load_cloud_config()
+        if "server_url" in cfg:
+            cur["server_url"] = cfg["server_url"].strip().rstrip("/") or DEFAULT_CLOUD_URL
+        if "username" in cfg:
+            cur["username"] = cfg["username"].strip().lower()
+        if "password" in cfg:
+            cur["password"] = cfg["password"].strip()
+        if "device_name" in cfg and cfg["device_name"].strip():
+            cur["device_name"] = cfg["device_name"].strip()
+        if "auto_sync" in cfg:
+            cur["auto_sync"] = bool(cfg["auto_sync"])
+        if "enabled_appids" in cfg and isinstance(cfg["enabled_appids"], list):
+            cur["enabled_appids"] = sorted(list({str(x) for x in cfg["enabled_appids"]}))
+        _reg_write_json("CloudConfig", cur)
+    except Exception:
+        pass
+
+def is_game_cloud_enabled(appid):
+    cfg = load_cloud_config()
+    return str(appid) in set(cfg.get("enabled_appids", []))
+
+def load_sync_state():
+    data = _reg_read_json("SyncState")
+    return data if isinstance(data, dict) else {}
+
+def update_sync_state(username, appid, files_sha256, cloud_sha256, mtime, active_filename="latest.zip"):
+    try:
+        st = load_sync_state()
+        key = f"{(username or '').lower()}:{appid}"
+        st[key] = {
+            "files_sha256": files_sha256 or "",
+            "cloud_sha256": cloud_sha256 or "",
+            "mtime": int(mtime or 0),
+            "active_filename": active_filename or "latest.zip",
+            "synced_at": int(time.time())
+        }
+        _reg_write_json("SyncState", st)
+    except Exception:
+        pass
+
+def get_last_sync_record(username, appid):
+    st = load_sync_state()
+    return st.get(f"{(username or '').lower()}:{appid}", {})
+
+def get_startup_command():
+    exe_candidate = os.path.join(BASE_DIR, "SteamSwitcher.exe")
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    if os.path.exists(exe_candidate):
+        return f'"{exe_candidate}" --tray'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    runner = pyw if os.path.exists(pyw) else sys.executable
+    return f'"{runner}" "{os.path.abspath(__file__)}" --tray'
+
+def is_windows_startup_enabled():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_READ)
+        val, _ = winreg.QueryValueEx(key, STARTUP_REG_NAME)
+        winreg.CloseKey(key)
+        return bool(val)
+    except Exception:
+        return False
+
+def set_windows_startup_tray(enabled):
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH)
+        if enabled:
+            winreg.SetValueEx(key, STARTUP_REG_NAME, 0, winreg.REG_SZ, get_startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_REG_NAME)
+            except Exception:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
+
+def load_window_state():
+    startup_reg = is_windows_startup_enabled()
+    default = {
+        "width": 1280,
+        "height": 820,
+        "x": None,
+        "y": None,
+        "theme": "dark",
+        "selected_account": "ALL",
+        "hide_to_tray_on_exit": True,
+        "start_at_startup_tray": startup_reg
+    }
+    data = _reg_read_json("WindowState")
+    if isinstance(data, dict):
+        try:
+            return {
+                "width": max(600, int(data.get("width", 1280))),
+                "height": max(420, int(data.get("height", 820))),
+                "x": data.get("x"),
+                "y": data.get("y"),
+                "theme": data.get("theme", "dark"),
+                "selected_account": data.get("selected_account", "ALL"),
+                "hide_to_tray_on_exit": bool(data.get("hide_to_tray_on_exit", True)),
+                "start_at_startup_tray": startup_reg
+            }
+        except Exception:
+            pass
+    return default
+
+def save_window_state(state):
+    try:
+        cur = load_window_state()
+        if "width" in state and state["width"]:
+            cur["width"] = max(600, int(state["width"]))
+        if "height" in state and state["height"]:
+            cur["height"] = max(420, int(state["height"]))
+        if "x" in state and state["x"] is not None:
+            cur["x"] = int(state["x"])
+        if "y" in state and state["y"] is not None:
+            cur["y"] = int(state["y"])
+        if "theme" in state and state["theme"] in ("dark", "light"):
+            cur["theme"] = state["theme"]
+        if "selected_account" in state and state["selected_account"]:
+            cur["selected_account"] = state["selected_account"]
+        if "hide_to_tray_on_exit" in state:
+            cur["hide_to_tray_on_exit"] = bool(state["hide_to_tray_on_exit"])
+        if "start_at_startup_tray" in state:
+            enabled = bool(state["start_at_startup_tray"])
+            set_windows_startup_tray(enabled)
+            cur["start_at_startup_tray"] = enabled
+        _reg_write_json("WindowState", cur)
+    except Exception:
+        pass
+
+def get_steam_registry_info():
+    info = {
+        "steam_path": r"C:\Program Files (x86)\Steam",
+        "steam_exe": r"C:\Program Files (x86)\Steam\steam.exe",
+        "auto_login_user": "",
+        "active_user_sid3": 0,
+        "running_appid": 0
+    }
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_READ)
+        try:
+            sp, _ = winreg.QueryValueEx(key, "SteamPath")
+            if sp:
+                info["steam_path"] = os.path.normpath(sp)
+        except Exception:
+            pass
+        try:
+            se, _ = winreg.QueryValueEx(key, "SteamExe")
+            if se:
+                info["steam_exe"] = os.path.normpath(se)
+        except Exception:
+            pass
+        try:
+            alu, _ = winreg.QueryValueEx(key, "AutoLoginUser")
+            if alu:
+                info["auto_login_user"] = alu
+        except Exception:
+            pass
+        try:
+            r_app, _ = winreg.QueryValueEx(key, "RunningAppID")
+            info["running_appid"] = int(r_app) if r_app else 0
+        except Exception:
+            pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    try:
+        akey = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam\ActiveProcess", 0, winreg.KEY_READ)
+        au, _ = winreg.QueryValueEx(akey, "ActiveUser")
+        info["active_user_sid3"] = int(au) if au else 0
+        winreg.CloseKey(akey)
+    except Exception:
+        pass
+    return info
+
+def is_app_running_in_steam(appid):
+    reg = get_steam_registry_info()
+    if str(reg.get("running_appid", 0)) == str(appid):
+        return True
+    try:
+        akey = winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\Valve\Steam\Apps\{appid}", 0, winreg.KEY_READ)
+        try:
+            running, _ = winreg.QueryValueEx(akey, "Running")
+            if int(running) == 1:
+                winreg.CloseKey(akey)
+                return True
+        except Exception:
+            pass
+        try:
+            launching, _ = winreg.QueryValueEx(akey, "Launching")
+            if int(launching) == 1:
+                winreg.CloseKey(akey)
+                return True
+        except Exception:
+            pass
+        winreg.CloseKey(akey)
+    except Exception:
+        pass
+    return False
+
+def get_uploading_appids():
+    now = time.time()
+    active = set(UPLOADING_APPIDS)
+    for aid, until_ts in list(UPLOADING_UNTIL.items()):
+        if until_ts > now:
+            active.add(str(aid))
+        else:
+            UPLOADING_UNTIL.pop(aid, None)
+    return sorted(list(active))
+
+def get_running_appids(candidate_appids=None):
+    running_set = set()
+    reg = get_steam_registry_info()
+    r_aid = reg.get("running_appid", 0)
+    if r_aid and int(r_aid) > 0:
+        running_set.add(str(r_aid))
+    cands = candidate_appids
+    if cands is None and STATE_CACHE and "games" in STATE_CACHE:
+        cands = [str(g["appid"]) for g in STATE_CACHE["games"]]
+    if cands:
+        now = time.time()
+        for aid in cands:
+            aid_s = str(aid)
+            if is_app_running_in_steam(aid_s):
+                running_set.add(aid_s)
+                LAUNCHING_UNTIL.pop(aid_s, None)
+            elif LAUNCHING_UNTIL.get(aid_s, 0) > now:
+                running_set.add(aid_s)
+    # Attach background watcher to any running game so auto-upload triggers as soon as it stops
+    if running_set and STATE_CACHE and "games" in STATE_CACHE:
+        steam_path = reg["steam_path"]
+        accounts = parse_loginusers(steam_path)
+        for r_id in running_set:
+            if r_id not in ACTIVE_WATCHERS:
+                g_match = next((g for g in STATE_CACHE["games"] if str(g["appid"]) == r_id), None)
+                if g_match:
+                    acc_info = accounts.get(g_match.get("owner_account", ""), {})
+                    threading.Thread(
+                        target=watch_game_and_auto_upload,
+                        args=(steam_path, r_id, acc_info, g_match.get("name", f"App {r_id}")),
+                        daemon=True
+                    ).start()
+    return sorted(list(running_set))
+
+def is_steam_running():
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stderr=subprocess.DEVNULL
+        ).decode("utf-8", errors="ignore")
+        return "steam.exe" in out.lower()
+    except Exception:
+        return False
+
+def _parse_vdf_binary_dict(buf, offset, max_end, strings):
+    res = {}
+    while offset < max_end:
+        t = buf[offset]
+        offset += 1
+        if t == 0x08:
+            break
+        if offset + 4 > max_end:
+            break
+        key_idx = struct.unpack("<I", buf[offset:offset+4])[0]
+        key = strings[key_idx] if key_idx < len(strings) else str(key_idx)
+        offset += 4
+        if t == 0x00:
+            val, offset = _parse_vdf_binary_dict(buf, offset, max_end, strings)
+            res[key] = val
+        elif t == 0x01:
+            s_end = buf.find(b"\x00", offset, max_end)
+            if s_end == -1:
+                break
+            res[key] = buf[offset:s_end].decode("utf-8", errors="replace")
+            offset = s_end + 1
+        elif t == 0x02:
+            res[key] = struct.unpack("<i", buf[offset:offset+4])[0]
+            offset += 4
+        elif t == 0x07:
+            res[key] = struct.unpack("<Q", buf[offset:offset+8])[0]
+            offset += 8
+        else:
+            break
+    return res, offset
+
+def parse_appinfo_vdf(steam_path, extract_ufs_appids=None):
+    """Fast binary VDF v29 parser for appinfo.vdf to extract game names, types, and UFS save rules."""
+    appinfo_path = os.path.join(steam_path, "appcache", "appinfo.vdf")
+    result = {}
+    if not os.path.exists(appinfo_path):
+        return result
+    try:
+        with open(appinfo_path, "rb") as f:
+            data = f.read()
+        if len(data) < 16:
+            return result
+        magic, _ = struct.unpack("<II", data[:8])
+        if magic == 0x07564429:
+            str_table_offset = struct.unpack("<q", data[8:16])[0]
+            num_strings = struct.unpack("<I", data[str_table_offset:str_table_offset+4])[0]
+            pos = str_table_offset + 4
+            strings = []
+            for _ in range(num_strings):
+                end = data.find(b"\x00", pos)
+                if end == -1:
+                    break
+                strings.append(data[pos:end].decode("utf-8", errors="replace"))
+                pos = end + 1
+            name_idx = strings.index("name") if "name" in strings else -1
+            type_idx = strings.index("type") if "type" in strings else -1
+            if name_idx == -1:
+                return result
+            name_pat = b"\x01" + struct.pack("<I", name_idx)
+            type_pat = b"\x01" + struct.pack("<I", type_idx) if type_idx != -1 else None
+
+            pos = 16
+            while pos < str_table_offset - 8:
+                appid, size = struct.unpack("<II", data[pos:pos+8])
+                if appid == 0 or size <= 0:
+                    break
+                entry_end = pos + 8 + size
+                vdf_pos = pos + 68
+                if entry_end > str_table_offset:
+                    break
+                aid_str = str(appid)
+                n_pos = data.find(name_pat, vdf_pos, entry_end)
+                if n_pos != -1:
+                    s_end = data.find(b"\x00", n_pos + 5, entry_end)
+                    if s_end != -1:
+                        gname = data[n_pos+5:s_end].decode("utf-8", errors="replace")
+                        gtype = "game"
+                        if type_pat:
+                            t_pos = data.find(type_pat, vdf_pos, entry_end)
+                            if t_pos != -1:
+                                t_end = data.find(b"\x00", t_pos + 5, entry_end)
+                                if t_end != -1:
+                                    gtype = data[t_pos+5:t_end].decode("utf-8", errors="replace").lower()
+                        result[aid_str] = {"name": gname, "type": gtype}
+
+                if extract_ufs_appids and aid_str in extract_ufs_appids and aid_str not in UFS_CACHE:
+                    try:
+                        parsed_dict, _ = _parse_vdf_binary_dict(data, vdf_pos, entry_end, strings)
+                        ufs_block = parsed_dict.get("appinfo", {}).get("ufs", {}).get("savefiles", {})
+                        if ufs_block:
+                            UFS_CACHE[aid_str] = list(ufs_block.values())
+                    except Exception:
+                        pass
+                pos = entry_end
+    except Exception:
+        pass
+    return result
+
+def resolve_root_base_dir(root_name, steam_path, sid3, appid):
+    r = str(root_name).lower()
+    user_profile = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+    if r in ("winmydocuments", "2"):
+        return os.path.join(user_profile, "Documents")
+    if r in ("winappdatalocal", "3"):
+        return os.environ.get("LOCALAPPDATA", os.path.join(user_profile, "AppData", "Local"))
+    if r in ("winappdatalocallow", "12"):
+        return os.path.join(user_profile, "AppData", "LocalLow")
+    if r in ("winappdataroaming", "4"):
+        return os.environ.get("APPDATA", os.path.join(user_profile, "AppData", "Roaming"))
+    if r in ("winsavedgames", "11"):
+        return os.path.join(user_profile, "Saved Games")
+    if r in ("0", "default", "steamcloudDocuments"):
+        return os.path.join(steam_path, "userdata", str(sid3), str(appid), "remote")
+    return None
+
+def get_game_save_targets(steam_path, appid, account_info):
+    """Return list of {"dir": resolved_folder, "pattern": file_pattern} for a game."""
+    sid64 = account_info.get("steamid64", "")
+    sid3 = account_info.get("steamid3", "")
+    targets = []
+
+    if appid not in UFS_CACHE:
+        parse_appinfo_vdf(steam_path, extract_ufs_appids={str(appid)})
+
+    ufs_rules = UFS_CACHE.get(str(appid), [])
+    for rule in ufs_rules:
+        platforms = rule.get("platforms", {})
+        if platforms and "windows" not in [str(v).lower() for v in platforms.values()]:
+            continue
+        base_dir = resolve_root_base_dir(rule.get("root", ""), steam_path, sid3, appid)
+        if not base_dir:
+            continue
+        rel_path_raw = rule.get("path", "").replace("/", os.sep).replace("\\", os.sep).strip(os.sep)
+        rel_path = rel_path_raw.replace("{64BitSteamID}", sid64).replace("{Steam3AccountID}", sid3)
+        full_dir = os.path.normpath(os.path.join(base_dir, rel_path))
+        pattern = rule.get("pattern", "*")
+        targets.append({"dir": full_dir, "pattern": pattern})
+
+        # If {64BitSteamID} folder for this account doesn't exist yet, check if saves exist under another SteamID64 folder and migrate/include them
+        if "{64BitSteamID}" in rel_path_raw and not os.path.isdir(full_dir):
+            glob_rel = rel_path_raw.replace("{64BitSteamID}", "*").replace("{Steam3AccountID}", "*")
+            for cand in glob.glob(os.path.join(base_dir, glob_rel)):
+                if os.path.isdir(cand):
+                    try:
+                        os.makedirs(full_dir, exist_ok=True)
+                        for item in os.listdir(cand):
+                            s_item = os.path.join(cand, item)
+                            d_item = os.path.join(full_dir, item)
+                            if os.path.isfile(s_item) and not os.path.exists(d_item):
+                                shutil.copy2(s_item, d_item)
+                    except Exception:
+                        pass
+
+    # Also check userdata/<sid3>/<appid>/remote
+    remote_dir = os.path.join(steam_path, "userdata", str(sid3), str(appid), "remote")
+    if os.path.isdir(remote_dir) or not targets:
+        targets.append({"dir": remote_dir, "pattern": "*"})
+
+    # De-duplicate targets
+    unique = []
+    seen = set()
+    for t in targets:
+        key = (t["dir"].lower(), t["pattern"].lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(t)
+    return unique
+
+def collect_local_save_files(steam_path, appid, account_info):
+    """Find all matching local save files for a game directly in Steam's save folder, returning (files_list, latest_mtime, combined_sha256)."""
+    targets = get_game_save_targets(steam_path, appid, account_info)
+    matched_files = []  # list of (target_idx, rel_path_in_target, abs_path, mtime)
+    latest_mtime = 0
+
+    for idx, t in enumerate(targets):
+        base_dir = t["dir"]
+        pattern = t["pattern"]
+        if not os.path.isdir(base_dir):
+            continue
+        for root, _, files in os.walk(base_dir):
+            for fname in files:
+                if fname.lower() == "steam_autocloud.vdf":
+                    continue
+                if fnmatch.fnmatch(fname.lower(), pattern.lower()) or pattern == "*":
+                    abs_p = os.path.join(root, fname)
+                    rel_p = os.path.relpath(abs_p, base_dir).replace("\\", "/")
+                    mtime = int(os.path.getmtime(abs_p))
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                    matched_files.append((idx, rel_p, abs_p, mtime))
+
+    if not matched_files:
+        return [], 0, ""
+
+    matched_files.sort(key=lambda x: (x[0], x[1]))
+    h = hashlib.sha256()
+    for idx, rel_p, abs_p, _ in matched_files:
+        h.update(f"{idx}:{rel_p}:".encode("utf-8"))
+        try:
+            h.update(open(abs_p, "rb").read())
+        except Exception:
+            pass
+    return matched_files, latest_mtime, h.hexdigest()
+
+def pack_save_zip_bytes(steam_path, appid, account_info):
+    files, latest_mtime, content_sha = collect_local_save_files(steam_path, appid, account_info)
+    if not files:
+        return None, 0, ""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = {"appid": str(appid), "files_sha256": content_sha, "updated_at": latest_mtime}
+        zf.writestr("_cloud_manifest.json", json.dumps(manifest))
+        for idx, rel_p, abs_p, mtime in files:
+            arcname = f"t{idx}/{rel_p}"
+            zf.write(abs_p, arcname)
+    return buf.getvalue(), latest_mtime, content_sha
+
+def unpack_save_zip_bytes(steam_path, appid, account_info, zip_bytes, mtime_to_apply=None):
+    targets = get_game_save_targets(steam_path, appid, account_info)
+    if not targets:
+        return False
+
+    buf = io.BytesIO(zip_bytes)
+    with zipfile.ZipFile(buf, "r") as zf:
+        for member in zf.namelist():
+            if member == "_cloud_manifest.json" or member.endswith("/"):
+                continue
+            parts = member.split("/", 1)
+            if len(parts) == 2 and parts[0].startswith("t") and parts[0][1:].isdigit():
+                t_idx = int(parts[0][1:])
+                rel_p = parts[1]
+            else:
+                t_idx = 0
+                rel_p = member
+            if t_idx >= len(targets):
+                t_idx = 0
+            dest_base = targets[t_idx]["dir"]
+            dest_path = os.path.normpath(os.path.join(dest_base, rel_p))
+            if not dest_path.startswith(os.path.normpath(dest_base)):
+                continue
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with open(dest_path, "wb") as out_f:
+                out_f.write(zf.read(member))
+            if mtime_to_apply:
+                try:
+                    os.utime(dest_path, (mtime_to_apply, mtime_to_apply))
+                except Exception:
+                    pass
+    return True
+
+def cloud_request(path, method="GET", body=None, headers=None, timeout=6, custom_cfg=None):
+    cfg = custom_cfg or load_cloud_config()
+    base_url = cfg.get("server_url", "").rstrip("/")
+    if not base_url:
+        return None, "Server URL belum diisi"
+    url = f"{base_url}{path}"
+    req_headers = {
+        "X-Cloud-User": urllib.parse.quote(cfg.get("username", "")),
+        "X-Cloud-Pass": urllib.parse.quote(cfg.get("password", "")),
+        "User-Agent": "SteamSwitcherCloud/2.0"
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read()
+            if "application/json" in ctype:
+                return json.loads(raw.decode("utf-8", errors="ignore")), None
+            return raw, None
+    except urllib.error.HTTPError as he:
+        try:
+            err_json = json.loads(he.read().decode("utf-8", errors="ignore"))
+            return None, err_json.get("error") or str(he)
+        except Exception:
+            return None, str(he)
+    except Exception as e:
+        return None, str(e)
+
+def is_local_and_cloud_same(has_local, local_mtime, local_sha, cloud_exists, cloud_meta, username, appid):
+    """Determine if local save and cloud save are identical (timezone-independent UTC epoch + SHA256 check)."""
+    if not has_local or not cloud_exists or not cloud_meta:
+        return False
+    cloud_mtime = int(cloud_meta.get("updated_at", 0))
+    cloud_files_sha = cloud_meta.get("files_sha256", "")
+    cloud_zip_sha = cloud_meta.get("sha256", "")
+    if cloud_files_sha and local_sha and cloud_files_sha == local_sha:
+        return True
+    if abs(local_mtime - cloud_mtime) <= 2:
+        return True
+    last_rec = get_last_sync_record(username, appid)
+    if (
+        last_rec.get("files_sha256") == local_sha
+        and last_rec.get("cloud_sha256") == cloud_zip_sha
+        and cloud_zip_sha != ""
+    ):
+        return True
+    return False
+
+def sync_game_save(steam_path, appid, account_info, game_name, direction="auto", check_conflict=False):
+    """
+    direction: 'auto' (smart compare), 'upload' (force upload local), 'download' (force download cloud)
+    If check_conflict=True and local is strictly newer than cloud (when cloud exists), returns ('conflict', info_dict).
+    Returns (ok, action_taken, message_or_dict)
+    """
+    cfg = load_cloud_config()
+    username = cfg.get("username", "")
+    if not cfg.get("server_url") or not username or not cfg.get("password"):
+        return True, "skipped", "Belum login Cloud"
+
+    zip_bytes, local_mtime, local_sha = pack_save_zip_bytes(steam_path, appid, account_info)
+    has_local = zip_bytes is not None
+
+    meta_resp, err = cloud_request(f"/api/saves/{appid}/meta", timeout=4)
+    if err or not isinstance(meta_resp, dict):
+        return False, "error", f"Cloud tidak terjangkau: {err}"
+
+    cloud_exists = bool(meta_resp.get("exists") and meta_resp.get("meta"))
+    cloud_meta = meta_resp.get("meta") or {}
+    cloud_mtime = int(cloud_meta.get("updated_at", 0))
+    cloud_zip_sha = cloud_meta.get("sha256", "")
+
+    # 1. If direction is auto and both exist and are identical -> in_sync immediately!
+    if direction == "auto" and is_local_and_cloud_same(has_local, local_mtime, local_sha, cloud_exists, cloud_meta, username, appid):
+        return True, "in_sync", f"Save '{game_name}' sudah sama & terbaru."
+
+    # 2. If direction == 'download' OR (direction == 'auto' and Cloud is newer or local doesn't exist) -> auto use Cloud
+    if direction == "download" or (
+        direction == "auto" and cloud_exists and (not has_local or cloud_mtime > local_mtime + 2)
+    ):
+        dl_bytes, dl_err = cloud_request(f"/api/saves/{appid}/download", timeout=15)
+        if dl_err or not isinstance(dl_bytes, bytes):
+            return False, "error", f"Gagal mengunduh save dari Cloud: {dl_err}"
+        unpack_save_zip_bytes(steam_path, appid, account_info, dl_bytes, mtime_to_apply=cloud_mtime)
+        _, new_local_mtime, new_local_sha = collect_local_save_files(steam_path, appid, account_info)
+        update_sync_state(username, appid, new_local_sha, cloud_zip_sha, cloud_mtime, active_filename="latest.zip")
+        return True, "downloaded", f"Save terbaru '{game_name}' diunduh dari Cloud ({cloud_meta.get('device', 'Cloud')})"
+
+    # 3. If direction == 'auto' and Local is newer than existing Cloud save -> ask user if check_conflict=True!
+    if (
+        direction == "auto"
+        and check_conflict
+        and has_local
+        and cloud_exists
+        and local_mtime > cloud_mtime + 2
+    ):
+        return True, "conflict", {
+            "appid": str(appid),
+            "account": account_info.get("account_name", ""),
+            "game_name": game_name,
+            "local_mtime": local_mtime,
+            "cloud_mtime": cloud_mtime,
+            "cloud_device": cloud_meta.get("device", "Cloud")
+        }
+
+    # 4. Upload local save to Cloud (when direction == 'upload', or first time upload when cloud doesn't exist, or post-game auto upload)
+    if direction == "upload" or (
+        direction == "auto" and has_local and (not cloud_exists or local_mtime > cloud_mtime + 2)
+    ):
+        if not has_local:
+            return False, "none", "Belum ada file save lokal untuk di-upload"
+        up_headers = {
+            "Content-Type": "application/zip",
+            "X-Save-Mtime": str(local_mtime),
+            "X-Save-Content-Sha": local_sha,
+            "X-Device-Name": cfg.get("device_name", "PC"),
+            "X-Game-Name": urllib.parse.quote(game_name),
+            "X-Account-Name": account_info.get("account_name", "")
+        }
+        up_resp, up_err = cloud_request(
+            f"/api/saves/{appid}/upload",
+            method="POST",
+            body=zip_bytes,
+            headers=up_headers,
+            timeout=20
+        )
+        if up_err:
+            return False, "error", f"Gagal upload save ke Cloud: {up_err}"
+        new_cloud_sha = (up_resp.get("meta", {}) if isinstance(up_resp, dict) else {}).get("sha256", hashlib.sha256(zip_bytes).hexdigest())
+        update_sync_state(username, appid, local_sha, new_cloud_sha, local_mtime, active_filename="latest.zip")
+        return True, "uploaded", f"Save '{game_name}' berhasil di-upload ke Cloud!"
+
+    return True, "in_sync", f"Save '{game_name}' sudah versi terbaru."
+
+def get_combined_save_history(steam_path, appid, account_info):
+    """Return up to MAX_SAVE_HISTORY (5) save versions from Cloud Server, directly comparing with live Steam save folder."""
+    local_files, local_mtime, local_sha = collect_local_save_files(steam_path, appid, account_info)
+    has_local = len(local_files) > 0
+
+    entries = []
+    cfg = load_cloud_config()
+    username = cfg.get("username", "")
+    last_rec = get_last_sync_record(username, appid)
+    meta_files_sha = ""
+    meta_device = "Cloud"
+
+    if cfg.get("server_url") and username and cfg.get("password"):
+        m_resp, m_err = cloud_request(f"/api/saves/{appid}/meta", timeout=4)
+        if not m_err and isinstance(m_resp, dict) and m_resp.get("exists") and m_resp.get("meta"):
+            meta_obj = m_resp["meta"]
+            meta_files_sha = meta_obj.get("files_sha256", "")
+            meta_device = meta_obj.get("device", "Cloud")
+
+        h_resp, h_err = cloud_request(f"/api/saves/{appid}/history", timeout=4)
+        if not h_err and isinstance(h_resp, dict) and isinstance(h_resp.get("history"), list):
+            for item in h_resp["history"]:
+                mtime = int(item.get("mtime", 0))
+                fn = item.get("filename", "")
+                is_lat = bool(item.get("is_latest"))
+                entries.append({
+                    "source": "cloud",
+                    "filename": fn,
+                    "is_latest": is_lat,
+                    "mtime": mtime,
+                    "size_kb": round(int(item.get("size_bytes", 0)) / 1024, 1),
+                    "label": f"Cloud Terbaru ({item.get('device') or meta_device})" if is_lat else "Riwayat Cloud",
+                    "is_used": False
+                })
+        elif not m_err and isinstance(m_resp, dict) and m_resp.get("exists") and m_resp.get("meta"):
+            meta = m_resp["meta"]
+            mtime = int(meta.get("updated_at", 0))
+            sz = int(meta.get("size_bytes", 0))
+            entries.append({
+                "source": "cloud",
+                "filename": "latest.zip",
+                "is_latest": True,
+                "mtime": mtime,
+                "size_kb": round(sz / 1024, 1),
+                "label": f"Cloud Terbaru ({meta.get('device', 'Cloud')})",
+                "is_used": False
+            })
+
+    entries.sort(key=lambda x: (1 if x["is_latest"] else 0, x["mtime"]), reverse=True)
+    entries = entries[:MAX_SAVE_HISTORY]
+
+    # Directly compare live Steam save folder against Cloud history entries to mark which version is currently used
+    matched_idx = None
+    if has_local and entries:
+        active_fn = last_rec.get("active_filename", "")
+        # 1. Exact SHA256 match with last restored/synced file in Registry
+        if local_sha and last_rec.get("files_sha256") == local_sha and active_fn:
+            for i, e in enumerate(entries):
+                if e["filename"] == active_fn:
+                    matched_idx = i
+                    break
+        # 2. Exact SHA256 match with Cloud latest.zip meta
+        if matched_idx is None and local_sha and meta_files_sha and local_sha == meta_files_sha:
+            for i, e in enumerate(entries):
+                if e["filename"] == "latest.zip":
+                    matched_idx = i
+                    break
+        # 3. Direct mtime comparison between live Steam save folder and Cloud history versions
+        if matched_idx is None:
+            for i, e in enumerate(entries):
+                if abs(int(e["mtime"]) - int(local_mtime)) <= 2:
+                    matched_idx = i
+                    break
+
+    if matched_idx is not None:
+        entries[matched_idx]["is_used"] = True
+
+    local_info = {
+        "exists": has_local,
+        "mtime": local_mtime,
+        "files_count": len(local_files),
+        "matched": matched_idx is not None,
+        "matched_index": (matched_idx + 1) if matched_idx is not None else None
+    }
+    return entries, local_info
+
+def restore_save_from_history(steam_path, appid, account_info, game_name, source, filename, mtime_hint=0):
+    """Restore a specific save version from Cloud history directly into Steam's save folder and mark it as active."""
+    target_mtime = int(mtime_hint) if mtime_hint else int(time.time())
+    parts = os.path.basename(filename).split("_")
+    if parts and parts[0].isdigit():
+        target_mtime = int(parts[0])
+
+    if filename == "latest.zip":
+        dl_bytes, dl_err = cloud_request(f"/api/saves/{appid}/download", timeout=15)
+    else:
+        dl_bytes, dl_err = cloud_request(f"/api/saves/{appid}/history/{urllib.parse.quote(filename)}", timeout=15)
+    if dl_err or not isinstance(dl_bytes, bytes):
+        return False, f"Gagal mengunduh riwayat dari Cloud: {dl_err}"
+
+    # Read exact timestamp from _cloud_manifest.json inside zip if available
+    try:
+        with zipfile.ZipFile(io.BytesIO(dl_bytes), "r") as zf:
+            if "_cloud_manifest.json" in zf.namelist():
+                man = json.loads(zf.read("_cloud_manifest.json").decode("utf-8", errors="ignore"))
+                if man.get("updated_at"):
+                    target_mtime = int(man["updated_at"])
+    except Exception:
+        pass
+
+    ok = unpack_save_zip_bytes(steam_path, appid, account_info, dl_bytes, mtime_to_apply=target_mtime)
+    if not ok:
+        return False, "Gagal mengekstrak file riwayat save ke folder Steam."
+
+    _, new_local_mtime, new_local_sha = collect_local_save_files(steam_path, appid, account_info)
+    cfg = load_cloud_config()
+    username = cfg.get("username", "")
+    last_rec = get_last_sync_record(username, appid)
+    cloud_sha = last_rec.get("cloud_sha256") or hashlib.sha256(dl_bytes).hexdigest()
+    update_sync_state(username, appid, new_local_sha, cloud_sha, target_mtime, active_filename=filename)
+
+    build_full_state()
+    return True, f"Versi save '{game_name}' berhasil diterapkan ke folder Steam!"
+
+def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
+    """Background watcher: waits for game to run in Steam, and auto-uploads save as soon as game exits if Cloud Save is checked."""
+    watch_key = str(appid)
+    if watch_key in ACTIVE_WATCHERS:
+        return
+    ACTIVE_WATCHERS.add(watch_key)
+    try:
+        _, initial_mtime, initial_sha = collect_local_save_files(steam_path, appid, account_info)
+        # 1. Wait up to 90 seconds for Steam to mark the game as Running
+        started = False
+        for _ in range(45):
+            if is_app_running_in_steam(appid):
+                started = True
+                break
+            time.sleep(2)
+        if started:
+            # 2. Wait while game is running
+            while is_app_running_in_steam(appid):
+                time.sleep(1.5)
+            # 3. Game just closed! Check if Cloud Save is enabled for this game
+            if is_game_cloud_enabled(appid):
+                UPLOADING_APPIDS.add(watch_key)
+                UPLOADING_UNTIL[watch_key] = time.time() + 4.5
+                try:
+                    time.sleep(2.0)
+                    _, new_mtime, new_sha = collect_local_save_files(steam_path, appid, account_info)
+                    if new_sha and new_sha != initial_sha:
+                        ok_u, act_u, msg_u = sync_game_save(steam_path, appid, account_info, game_name, direction="upload")
+                    else:
+                        ok_u, act_u, msg_u = sync_game_save(steam_path, appid, account_info, game_name, direction="auto")
+                    if isinstance(msg_u, str):
+                        LAST_UPLOAD_MSG[watch_key] = {"ts": int(time.time()), "message": msg_u, "action": act_u}
+                finally:
+                    UPLOADING_APPIDS.discard(watch_key)
+            build_full_state()
+        else:
+            # Fallback: check if save files changed after 30s
+            if is_game_cloud_enabled(appid):
+                _, new_mtime, new_sha = collect_local_save_files(steam_path, appid, account_info)
+                if new_sha and new_sha != initial_sha:
+                    UPLOADING_APPIDS.add(watch_key)
+                    UPLOADING_UNTIL[watch_key] = time.time() + 4.0
+                    try:
+                        ok_u, act_u, msg_u = sync_game_save(steam_path, appid, account_info, game_name, direction="upload")
+                        if isinstance(msg_u, str):
+                            LAST_UPLOAD_MSG[watch_key] = {"ts": int(time.time()), "message": msg_u, "action": act_u}
+                    finally:
+                        UPLOADING_APPIDS.discard(watch_key)
+                    build_full_state()
+    except Exception:
+        pass
+    finally:
+        UPLOADING_APPIDS.discard(watch_key)
+        ACTIVE_WATCHERS.discard(watch_key)
+
+def parse_loginusers(steam_path):
+    """Parse loginusers.vdf strictly for currently registered Steam accounts."""
+    vdf_path = os.path.join(steam_path, "config", "loginusers.vdf")
+    accounts = {}
+    if os.path.exists(vdf_path):
+        try:
+            txt = open(vdf_path, encoding="utf-8", errors="ignore").read()
+            for m in re.finditer(r'"(\d{17})"\s*\{([^}]+)\}', txt):
+                sid64 = m.group(1)
+                body = m.group(2)
+                acc = re.search(r'"AccountName"\s+"([^"]+)"', body)
+                pers = re.search(r'"PersonaName"\s+"([^"]+)"', body)
+                rem = re.search(r'"RememberPassword"\s+"([^"]+)"', body)
+                off = re.search(r'"WantsOfflineMode"\s+"([^"]+)"', body)
+                ts = re.search(r'"timestamp"\s+"([^"]+)"', body)
+                if acc:
+                    acc_name = acc.group(1)
+                    sid3 = str(int(sid64) - 76561197960265728)
+                    accounts[acc_name] = {
+                        "account_name": acc_name,
+                        "persona_name": pers.group(1) if pers else acc_name,
+                        "steamid64": sid64,
+                        "steamid3": sid3,
+                        "remember_password": (rem.group(1) == "1") if rem else True,
+                        "offline_mode": (off.group(1) == "1") if off else False,
+                        "timestamp": int(ts.group(1)) if (ts and ts.group(1).isdigit()) else 0
+                    }
+        except Exception:
+            pass
+    return accounts
+
+def get_library_folders(steam_path):
+    """Read libraryfolders.vdf to find all Steam library paths across drives."""
+    folders = [steam_path]
+    vdf_path = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
+    if os.path.exists(vdf_path):
+        try:
+            txt = open(vdf_path, encoding="utf-8", errors="ignore").read()
+            for m in re.finditer(r'"path"\s+"([^"]+)"', txt):
+                raw_path = m.group(1).replace("\\\\", "\\")
+                norm_path = os.path.normpath(raw_path)
+                if os.path.exists(norm_path) and norm_path not in folders:
+                    folders.append(norm_path)
+        except Exception:
+            pass
+    return folders
+
+def get_installed_games(steam_path):
+    """Scan all library folders for appmanifest_*.acf."""
+    installed = {}
+    folders = get_library_folders(steam_path)
+    for folder in folders:
+        steamapps = os.path.join(folder, "steamapps")
+        if not os.path.isdir(steamapps):
+            continue
+        drive = os.path.splitdrive(folder)[0] or folder
+        for acf in glob.glob(os.path.join(steamapps, "appmanifest_*.acf")):
+            try:
+                txt = open(acf, encoding="utf-8", errors="ignore").read()
+                m_id = re.search(r'"appid"\s+"(\d+)"', txt)
+                if not m_id:
+                    continue
+                appid = m_id.group(1)
+                if appid in NON_GAME_APPIDS:
+                    continue
+                m_name = re.search(r'"name"\s+"([^"]+)"', txt)
+                m_size = re.search(r'"SizeOnDisk"\s+"(\d+)"', txt)
+                m_lp = re.search(r'"LastPlayed"\s+"(\d+)"', txt)
+                m_owner = re.search(r'"LastOwner"\s+"(\d+)"', txt)
+
+                size_bytes = int(m_size.group(1)) if m_size else 0
+                installed[appid] = {
+                    "appid": appid,
+                    "name": m_name.group(1) if m_name else f"App {appid}",
+                    "size_bytes": size_bytes,
+                    "size_gb": round(size_bytes / (1024 ** 3), 2) if size_bytes > 0 else 0,
+                    "last_played": int(m_lp.group(1)) if m_lp else 0,
+                    "last_owner_sid64": m_owner.group(1) if m_owner else "",
+                    "drive": drive,
+                    "library_path": folder
+                }
+            except Exception:
+                pass
+    return installed
+
+def get_userdata_account_games(steam_path, accounts):
+    """Scan userdata/<steamid3> to discover which games each account owns/played, excluding hidden games."""
+    account_games = {acc_name: set() for acc_name in accounts}
+    last_played_per_acc = {acc_name: {} for acc_name in accounts}
+
+    for acc_name, acc in accounts.items():
+        sid3 = acc["steamid3"]
+        udir = os.path.join(steam_path, "userdata", sid3)
+        if not os.path.isdir(udir):
+            continue
+
+        hidden_ids = set()
+        cs_path = os.path.join(udir, "config", "cloudstorage", "cloud-storage-namespace-1.json")
+        if os.path.exists(cs_path):
+            try:
+                cs_txt = open(cs_path, encoding="utf-8", errors="ignore").read()
+                for m in re.finditer(r'\\"id\\":\\"hidden\\",\\"name\\":\\"Hidden\\",\\"added\\":\[([\d,\s]*)\]', cs_txt):
+                    for part in m.group(1).split(","):
+                        part = part.strip()
+                        if part.isdigit():
+                            hidden_ids.add(part)
+            except Exception:
+                pass
+
+        lcache_dir = os.path.join(udir, "config", "librarycache")
+        if os.path.isdir(lcache_dir):
+            for jf in glob.glob(os.path.join(lcache_dir, "*.json")):
+                aid = os.path.splitext(os.path.basename(jf))[0]
+                if aid.isdigit() and aid not in NON_GAME_APPIDS and aid not in hidden_ids:
+                    account_games[acc_name].add(aid)
+
+        lcfg = os.path.join(udir, "config", "localconfig.vdf")
+        if os.path.exists(lcfg):
+            try:
+                txt = open(lcfg, encoding="utf-8", errors="ignore").read()
+                for m in re.finditer(r'"(\d{4,8})"\s*\{\s*"LastPlayed"\s*"(\d+)"', txt):
+                    aid, lp = m.group(1), int(m.group(2))
+                    if aid not in NON_GAME_APPIDS and aid not in hidden_ids:
+                        account_games[acc_name].add(aid)
+                        last_played_per_acc[acc_name][aid] = lp
+            except Exception:
+                pass
+
+    return account_games, last_played_per_acc
+
+def find_local_cover(steam_path, appid):
+    """Find cached cover image in Steam's appcache/librarycache/<appid>."""
+    libcache = os.path.join(steam_path, "appcache", "librarycache", str(appid))
+    if not os.path.isdir(libcache):
+        return None
+    found_files = {}
+    for root, _, files in os.walk(libcache):
+        for f in files:
+            if f not in found_files:
+                found_files[f] = os.path.join(root, f)
+    for pref in ["library_600x900.jpg", "library_capsule.jpg", "library_header.jpg", "header.jpg"]:
+        if pref in found_files:
+            return found_files[pref]
+    for f, full_path in found_files.items():
+        if f.endswith(".jpg") and "blur" not in f and "hero" not in f:
+            return full_path
+    return None
+
+def build_full_state():
+    global STATE_CACHE
+    reg = get_steam_registry_info()
+    steam_path = reg["steam_path"]
+    accounts = parse_loginusers(steam_path)
+    installed = get_installed_games(steam_path)
+    account_games, last_played_per_acc = get_userdata_account_games(steam_path, accounts)
+
+    acc_sizes = {acc_name: len(gset) for acc_name, gset in account_games.items()}
+
+    all_appids = set()
+    for gset in account_games.values():
+        all_appids.update(gset)
+
+    appinfo = parse_appinfo_vdf(steam_path, extract_ufs_appids=all_appids)
+    running_ids = set(get_running_appids(all_appids))
+    uploading_ids = set(get_uploading_appids())
+    cloud_cfg_now = load_cloud_config()
+    enabled_cloud_ids = set(cloud_cfg_now.get("enabled_appids", []))
+
+    games_list = []
+    for aid in all_appids:
+        if aid in NON_GAME_APPIDS:
+            continue
+        info_meta = appinfo.get(aid, {})
+        gtype = info_meta.get("type", "game")
+        if gtype not in ("game", ""):
+            continue
+
+        inst_info = installed.get(aid)
+        has_local_cover = os.path.isdir(os.path.join(steam_path, "appcache", "librarycache", str(aid)))
+
+        name = (inst_info["name"] if inst_info else None) or info_meta.get("name")
+        if not name:
+            continue
+
+        associated_accounts = [acc_name for acc_name, gset in account_games.items() if aid in gset]
+        if not associated_accounts:
+            continue
+
+        associated_sorted = sorted(associated_accounts, key=lambda x: acc_sizes.get(x, 9999))
+        owner_account = associated_sorted[0]
+
+        lp_ts = inst_info["last_played"] if inst_info else 0
+        for acc_name in associated_accounts:
+            acc_lp = last_played_per_acc.get(acc_name, {}).get(aid, 0)
+            if acc_lp > lp_ts:
+                lp_ts = acc_lp
+
+        if aid not in COVER_CACHE:
+            cov_path = find_local_cover(steam_path, aid)
+            if cov_path and os.path.exists(cov_path):
+                try:
+                    with open(cov_path, "rb") as cf:
+                        raw_bytes = cf.read()
+                        COVER_CACHE[aid] = raw_bytes
+                        COVER_B64_CACHE[aid] = "data:image/jpeg;base64," + base64.b64encode(raw_bytes).decode("ascii")
+                except Exception:
+                    pass
+
+        acc_info = accounts.get(owner_account, {})
+        save_files, save_mtime, _ = collect_local_save_files(steam_path, aid, acc_info)
+
+        games_list.append({
+            "appid": aid,
+            "name": name,
+            "installed": inst_info is not None,
+            "running": str(aid) in running_ids,
+            "uploading": str(aid) in uploading_ids,
+            "cloud_enabled": str(aid) in enabled_cloud_ids,
+            "size_gb": inst_info["size_gb"] if inst_info else 0,
+            "drive": inst_info["drive"] if inst_info else "",
+            "last_played": lp_ts,
+            "owner_account": owner_account,
+            "owner_persona": acc_info.get("persona_name", owner_account),
+            "accounts": associated_accounts,
+            "has_local_cover": has_local_cover,
+            "cover_src": COVER_B64_CACHE.get(aid, f"/api/cover/{aid}"),
+            "has_local_save": len(save_files) > 0,
+            "local_save_mtime": save_mtime
+        })
+
+    games_list.sort(key=lambda g: (g["name"].lower(), g["appid"]))
+
+    accounts_list = []
+    for acc_name, acc in accounts.items():
+        acc_games = [g for g in games_list if g["owner_account"] == acc_name]
+        inst_count = sum(1 for g in acc_games if g["installed"])
+        accounts_list.append({
+            **acc,
+            "is_active": (acc_name.lower() == reg["auto_login_user"].lower()),
+            "installed_count": inst_count,
+            "total_count": len(acc_games)
+        })
+
+    accounts_list.sort(key=lambda a: a["account_name"].lower())
+
+    state = {
+        "steam_running": is_steam_running(),
+        "active_account": reg["auto_login_user"],
+        "steam_path": steam_path,
+        "logo_src": LOGO_B64_URI,
+        "accounts": accounts_list,
+        "games": games_list,
+        "window_state": load_window_state(),
+        "cloud_config": load_cloud_config()
+    }
+    with CACHE_LOCK:
+        STATE_CACHE = state
+    return state
+
+def get_cached_state():
+    with CACHE_LOCK:
+        if STATE_CACHE is not None:
+            return STATE_CACHE
+    return build_full_state()
+
+def set_steam_account(steam_path, target_account, offline_override=None):
+    """Switch Steam's AutoLoginUser in Registry, disable AlwaysShowUserChooser in config.vdf, and update loginusers.vdf."""
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
+        winreg.SetValueEx(key, "AutoLoginUser", 0, winreg.REG_SZ, target_account)
+        winreg.SetValueEx(key, "RememberPassword", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(key, "StartupModeTmpIsValid", 0, winreg.REG_DWORD, 0)
+        winreg.CloseKey(key)
+    except Exception as e:
+        return False, f"Gagal mengubah Registry: {e}"
+
+    cfg_vdf_path = os.path.join(steam_path, "config", "config.vdf")
+    if os.path.exists(cfg_vdf_path):
+        try:
+            ctxt = open(cfg_vdf_path, encoding="utf-8", errors="ignore").read()
+            if '"AlwaysShowUserChooser"' in ctxt:
+                new_ctxt = re.sub(r'("AlwaysShowUserChooser"\s+)"\d+"', r'\g<1>"0"', ctxt)
+                if new_ctxt != ctxt:
+                    with open(cfg_vdf_path, "w", encoding="utf-8") as f:
+                        f.write(new_ctxt)
+        except Exception:
+            pass
+
+    vdf_path = os.path.join(steam_path, "config", "loginusers.vdf")
+    if os.path.exists(vdf_path):
+        try:
+            txt = open(vdf_path, encoding="utf-8", errors="ignore").read()
+            now_ts = str(int(time.time()))
+
+            def ensure_kv(block_body, k, v):
+                if re.search(rf'"{k}"\s+"[^"]*"', block_body):
+                    return re.sub(rf'("{k}"\s+)"[^"]*"', rf'\g<1>"{v}"', block_body)
+                return block_body.rstrip() + f'\n\t\t"{k}"\t\t"{v}"\n\t'
+
+            def repl_block(match):
+                sid64 = match.group(1)
+                body = match.group(2)
+                m_acc = re.search(r'"AccountName"\s+"([^"]+)"', body)
+                is_target = m_acc and (m_acc.group(1).lower() == target_account.lower())
+                if is_target:
+                    body = ensure_kv(body, "RememberPassword", "1")
+                    body = ensure_kv(body, "AllowAutoLogin", "1")
+                    body = ensure_kv(body, "MostRecent", "1")
+                    body = ensure_kv(body, "AutoLogin", "1")
+                    body = ensure_kv(body, "timestamp", now_ts)
+                    if offline_override is not None:
+                        val = "1" if offline_override else "0"
+                        body = ensure_kv(body, "WantsOfflineMode", val)
+                    if re.search(r'"WantsOfflineMode"\s+"1"', body) or (offline_override is True):
+                        body = ensure_kv(body, "SkipOfflineModeWarning", "1")
+                else:
+                    body = ensure_kv(body, "MostRecent", "0")
+                    body = ensure_kv(body, "AutoLogin", "0")
+                return f'"{sid64}"\n\t{{{body}}}'
+
+            new_txt = re.sub(r'"(\d{17})"\s*\{([^}]+)\}', repl_block, txt)
+            with open(vdf_path, "w", encoding="utf-8") as f:
+                f.write(new_txt)
+        except Exception:
+            pass
+
+    build_full_state()
+    return True, "OK"
+
+def stop_steam_fast():
+    """Stop Steam quickly so it can restart under the new account."""
+    if not is_steam_running():
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "steam.exe", "/T"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5
+        )
+    except Exception:
+        pass
+    for _ in range(15):
+        if not is_steam_running():
+            break
+        time.sleep(0.15)
+
+def switch_and_launch(target_account, appid=None, install_mode=False, game_name="", conflict_choice=""):
+    reg = get_steam_registry_info()
+    steam_path = reg["steam_path"]
+    steam_exe = reg["steam_exe"]
+    current_acc = reg["auto_login_user"]
+    active_sid3 = reg["active_user_sid3"]
+    running = is_steam_running()
+
+    accounts = parse_loginusers(steam_path)
+    acc_info = accounts.get(target_account, {})
+    target_sid3 = int(acc_info.get("steamid3", -1))
+
+    # 1. Pre-Launch Cloud Save Smart Sync (Only if Cloud Save is checked for this game)
+    sync_note = ""
+    cloud_cfg = load_cloud_config()
+    game_cloud_on = bool(appid and is_game_cloud_enabled(appid))
+    if appid and not install_mode and game_cloud_on and cloud_cfg.get("server_url") and cloud_cfg.get("username") and cloud_cfg.get("auto_sync", True):
+        if conflict_choice == "local":
+            ok_s, action_s, msg_s = sync_game_save(steam_path, appid, acc_info, game_name or f"App {appid}", direction="upload")
+        elif conflict_choice == "cloud":
+            ok_s, action_s, msg_s = sync_game_save(steam_path, appid, acc_info, game_name or f"App {appid}", direction="download")
+        else:
+            ok_s, action_s, msg_s = sync_game_save(
+                steam_path, appid, acc_info, game_name or f"App {appid}", direction="auto", check_conflict=True
+            )
+            if action_s == "conflict" and isinstance(msg_s, dict):
+                return True, {"conflict": True, **msg_s}
+
+        if action_s in ("downloaded", "uploaded") and isinstance(msg_s, str):
+            sync_note = f" • {msg_s}"
+
+    # 2. Switch Steam Account if needed
+    need_restart = (
+        (not running)
+        or (current_acc.lower() != target_account.lower())
+        or (active_sid3 == 0)
+        or (target_sid3 != -1 and active_sid3 != target_sid3)
+    )
+
+    if need_restart:
+        if running:
+            stop_steam_fast()
+        ok, msg = set_steam_account(steam_path, target_account)
+        if not ok:
+            return False, msg
+
+    # 3. Launch Game or Steam
+    if appid:
+        if install_mode:
+            cmd = [steam_exe, f"steam://install/{appid}"]
+        else:
+            cmd = [steam_exe, "-applaunch", str(appid)]
+    else:
+        cmd = [steam_exe]
+
+    try:
+        subprocess.Popen(
+            cmd,
+            close_fds=True,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        if appid and not install_mode:
+            LAUNCHING_UNTIL[str(appid)] = time.time() + 18
+        # 4. Start background watcher to auto-upload save when user exits the game
+        if appid and not install_mode:
+            t = threading.Thread(
+                target=watch_game_and_auto_upload,
+                args=(steam_path, appid, acc_info, game_name or f"App {appid}"),
+                daemon=True
+            )
+            t.start()
+
+        base_msg = f"Akun '{target_account}' siap" + (f" & menjalankan {game_name or appid}!" if appid else " & membuka Steam!")
+        return True, base_msg + sync_note
+    except Exception as e:
+        return False, f"Gagal menjalankan Steam: {e}"
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class LauncherRequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def send_json(self, data, status=200):
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        global LAST_UI_ACTIVITY_TS
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/" or path == "/index.html":
+            LAST_UI_ACTIVITY_TS = time.time()
+            index_path = os.path.join(ASSET_DIR, "index.html")
+            if not os.path.exists(index_path):
+                index_path = os.path.join(BASE_DIR, "index.html")
+            if os.path.exists(index_path):
+                html_str = open(index_path, "r", encoding="utf-8", errors="ignore").read()
+                st = get_cached_state()
+                ws = st.get("window_state", {})
+                theme = ws.get("theme", "dark")
+                html_str = html_str.replace('data-theme="dark"', f'data-theme="{theme}"', 1)
+                inject_script = f"<script>window.__INITIAL_STATE__ = {json.dumps(st, ensure_ascii=False)};</script>"
+                html_str = html_str.replace("<!--__INJECT_STATE__-->", inject_script, 1)
+                raw = html_str.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(raw)
+            else:
+                self.send_error(404, "index.html not found")
+            return
+
+        if path == "/logo.png":
+            raw = LOGO_PNG_BYTES or _load_asset_bytes("logo.png")
+            if raw:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "public, max-age=31536000")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            self.send_error(404)
+            return
+
+        if path == "/favicon.ico":
+            raw = LOGO_ICO_BYTES or _load_asset_bytes("logo.ico") or LOGO_PNG_BYTES
+            if raw:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/x-icon")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "public, max-age=31536000")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            self.send_error(404)
+            return
+
+        if path == "/api/state":
+            LAST_UI_ACTIVITY_TS = time.time()
+            state = build_full_state()
+            self.send_json(state)
+            return
+
+        if path == "/api/running":
+            LAST_UI_ACTIVITY_TS = time.time()
+            self.send_json({
+                "ok": True,
+                "running_appids": get_running_appids(),
+                "uploading_appids": get_uploading_appids(),
+                "last_uploads": LAST_UPLOAD_MSG,
+                "active_account": get_steam_registry_info().get("auto_login_user", "")
+            })
+            return
+
+        if path.startswith("/api/cover/"):
+            appid = path.split("/api/cover/")[-1].split("?")[0]
+            raw = COVER_CACHE.get(appid)
+            if not raw:
+                reg = get_steam_registry_info()
+                local_img = find_local_cover(reg["steam_path"], appid)
+                if local_img and os.path.exists(local_img):
+                    try:
+                        raw = open(local_img, "rb").read()
+                        COVER_CACHE[appid] = raw
+                    except Exception:
+                        pass
+            if raw:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            cdn_url = f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid}/library_600x900.jpg"
+            self.send_response(302)
+            self.send_header("Location", cdn_url)
+            self.end_headers()
+            return
+
+        self.send_error(404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body_raw = self.rfile.read(length).decode("utf-8", errors="ignore") if length > 0 else "{}"
+        try:
+            payload = json.loads(body_raw)
+        except Exception:
+            payload = {}
+
+        if self.path == "/api/launch":
+            account = payload.get("account", "").strip()
+            appid = str(payload.get("appid", "")).strip()
+            game_name = payload.get("game_name", "").strip()
+            install_mode = bool(payload.get("install_mode", False))
+            conflict_choice = payload.get("conflict_choice", "").strip()
+            if not account:
+                self.send_json({"ok": False, "message": "Akun Steam belum dipilih!"}, 400)
+                return
+            ok, msg = switch_and_launch(
+                account,
+                appid if appid else None,
+                install_mode=install_mode,
+                game_name=game_name,
+                conflict_choice=conflict_choice
+            )
+            if isinstance(msg, dict) and msg.get("conflict"):
+                self.send_json({"ok": True, **msg})
+                return
+            self.send_json({"ok": ok, "message": msg})
+            return
+
+        if self.path == "/api/save_history":
+            appid = str(payload.get("appid", "")).strip()
+            account = payload.get("account", "").strip()
+            reg = get_steam_registry_info()
+            accounts = parse_loginusers(reg["steam_path"])
+            acc_info = accounts.get(account, {})
+            hist, local_info = get_combined_save_history(reg["steam_path"], appid, acc_info)
+            self.send_json({"ok": True, "history": hist, "local_save": local_info})
+            return
+
+        if self.path == "/api/restore_save_history":
+            appid = str(payload.get("appid", "")).strip()
+            account = payload.get("account", "").strip()
+            game_name = payload.get("game_name", "").strip() or f"App {appid}"
+            source = payload.get("source", "cloud").strip()
+            filename = payload.get("filename", "").strip()
+            mtime_hint = int(payload.get("mtime", 0) or 0)
+            reg = get_steam_registry_info()
+            accounts = parse_loginusers(reg["steam_path"])
+            acc_info = accounts.get(account, {})
+            ok, msg = restore_save_from_history(reg["steam_path"], appid, acc_info, game_name, source, filename, mtime_hint=mtime_hint)
+            self.send_json({"ok": ok, "message": msg})
+            return
+
+        if self.path == "/api/switch_account":
+            account = payload.get("account", "").strip()
+            if not account:
+                self.send_json({"ok": False, "message": "Akun Steam belum dipilih!"}, 400)
+                return
+            ok, msg = switch_and_launch(account, appid=None)
+            self.send_json({"ok": ok, "message": msg})
+            return
+
+        if self.path == "/api/toggle_offline":
+            account = payload.get("account", "").strip()
+            offline = bool(payload.get("offline", False))
+            reg = get_steam_registry_info()
+            ok, msg = set_steam_account(reg["steam_path"], account, offline_override=offline)
+            if ok:
+                self.send_json({"ok": True, "message": f"Mode {'Offline' if offline else 'Online'} diatur untuk {account}."})
+            else:
+                self.send_json({"ok": False, "message": msg}, 500)
+            return
+
+        if self.path == "/api/window_bounds":
+            save_window_state(payload)
+            if STATE_CACHE is not None:
+                STATE_CACHE["window_state"] = load_window_state()
+            self.send_json({"ok": True})
+            return
+
+        if self.path == "/api/open_window":
+            threading.Thread(target=open_app_window, daemon=True).start()
+            self.send_json({"ok": True})
+            return
+
+        if self.path == "/api/window_closed":
+            save_window_state(payload)
+            ws = load_window_state()
+            if STATE_CACHE is not None:
+                STATE_CACHE["window_state"] = ws
+            self.send_json({"ok": True})
+            if not ws.get("hide_to_tray_on_exit", True):
+                close_ts = time.time()
+                def _delayed_shutdown():
+                    time.sleep(1.8)
+                    # Only exit if no UI reconnected (e.g. reload) and no active game watcher
+                    if LAST_UI_ACTIVITY_TS <= close_ts and not ACTIVE_WATCHERS:
+                        shutdown_application()
+                threading.Thread(target=_delayed_shutdown, daemon=True).start()
+            return
+
+        if self.path == "/api/cloud_auth":
+            action = payload.get("action", "login")
+            if action == "logout":
+                save_cloud_config({"username": "", "password": ""})
+                build_full_state()
+                self.send_json({"ok": True, "message": "Berhasil logout dari Cloud Save."})
+                return
+
+            server_url = (payload.get("server_url") or "").strip().rstrip("/")
+            username = (payload.get("username") or "").strip().lower()
+            password = (payload.get("password") or "").strip()
+            device_name = (payload.get("device_name") or "").strip()
+            if not server_url or not username or not password:
+                self.send_json({"ok": False, "message": "Server URL, Username, dan Password wajib diisi."}, 400)
+                return
+
+            endpoint = "/api/register" if action == "register" else "/api/login"
+            req_body = json.dumps({"username": username, "password": password}).encode("utf-8")
+            temp_cfg = {"server_url": server_url, "username": username, "password": password}
+            resp, err = cloud_request(
+                endpoint,
+                method="POST",
+                body=req_body,
+                headers={"Content-Type": "application/json"},
+                timeout=6,
+                custom_cfg=temp_cfg
+            )
+            if err or not isinstance(resp, dict) or not resp.get("ok"):
+                self.send_json({"ok": False, "message": err or "Gagal autentikasi ke Server Cloud."}, 400)
+                return
+
+            save_cloud_config({
+                "server_url": server_url,
+                "username": resp.get("username", username),
+                "password": password,
+                "device_name": device_name
+            })
+            build_full_state()
+            self.send_json({"ok": True, "message": resp.get("message", "Berhasil!")})
+            return
+
+        if self.path == "/api/toggle_game_cloud":
+            appid = str(payload.get("appid", "")).strip()
+            enabled = bool(payload.get("enabled", False))
+            game_name = payload.get("game_name", "").strip() or f"App {appid}"
+            cfg = load_cloud_config()
+            cur_set = set(cfg.get("enabled_appids", []))
+            if enabled:
+                cur_set.add(appid)
+            else:
+                cur_set.discard(appid)
+            save_cloud_config({"enabled_appids": sorted(list(cur_set))})
+
+            uploading_now = False
+            if enabled and cfg.get("server_url") and cfg.get("username"):
+                UPLOADING_APPIDS.add(appid)
+                UPLOADING_UNTIL[appid] = time.time() + 3.5
+                uploading_now = True
+
+                def _bg_upload_on_toggle():
+                    try:
+                        reg = get_steam_registry_info()
+                        steam_path = reg["steam_path"]
+                        accounts = parse_loginusers(steam_path)
+                        g_match = next((g for g in (STATE_CACHE or {}).get("games", []) if str(g["appid"]) == appid), None)
+                        owner_acc = g_match["owner_account"] if g_match else reg.get("auto_login_user", "")
+                        acc_info = accounts.get(owner_acc, {})
+                        ok_u, act_u, msg_u = sync_game_save(steam_path, appid, acc_info, game_name, direction="auto")
+                        if isinstance(msg_u, str):
+                            LAST_UPLOAD_MSG[appid] = {"ts": int(time.time()), "message": msg_u, "action": act_u}
+                    except Exception:
+                        pass
+                    finally:
+                        UPLOADING_APPIDS.discard(appid)
+                        build_full_state()
+
+                threading.Thread(target=_bg_upload_on_toggle, daemon=True).start()
+
+            build_full_state()
+            status_str = "diaktifkan" if enabled else "dinonaktifkan"
+            self.send_json({
+                "ok": True,
+                "uploading": uploading_now,
+                "message": f"Cloud Save {status_str} untuk {game_name}."
+            })
+            return
+
+        if self.path == "/api/cloud_sync_all":
+            st = build_full_state()
+            steam_path = st["steam_path"]
+            accounts = parse_loginusers(steam_path)
+            synced_count = 0
+            details = []
+            enabled_games = [g for g in st["games"] if g.get("cloud_enabled")]
+            if not enabled_games:
+                self.send_json({"ok": True, "message": "Belum ada game yang dicentang Cloud Save."})
+                return
+            for g in enabled_games:
+                acc_info = accounts.get(g["owner_account"], {})
+                ok_s, act_s, msg_s = sync_game_save(steam_path, g["appid"], acc_info, g["name"], direction="auto")
+                if ok_s and act_s in ("uploaded", "downloaded", "in_sync"):
+                    synced_count += 1
+                    if act_s in ("uploaded", "downloaded"):
+                        details.append(msg_s)
+            build_full_state()
+            summary = f"Sinkronisasi selesai ({synced_count} game Cloud Save dicek)."
+            if details:
+                summary += " " + " | ".join(details[:2])
+            self.send_json({"ok": True, "message": summary})
+            return
+
+        self.send_error(404)
+
+
+def is_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+ELECTRON_RUNTIME_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
+    "SteamSwitcher",
+    "electron_v30"
+)
+ELECTRON_PROC = None
+
+ELECTRON_MAIN_JS = """const { app, BrowserWindow } = require('electron');
+const path = require('path');
+const os = require('os');
+
+app.setPath('userData', path.join(os.tmpdir(), 'SteamSwitcher_ElectronProfile'));
+app.commandLine.appendSwitch('disable-extensions');
+app.commandLine.appendSwitch('disable-sync');
+app.commandLine.appendSwitch('disable-features', 'Translate');
+app.commandLine.appendSwitch('no-proxy-server');
+
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  let win = null;
+  app.on('second-instance', () => {
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    }
+  });
+
+  app.whenReady().then(() => {
+    const args = process.argv;
+    let url = 'http://127.0.0.1:18420';
+    let w = 1280, h = 820, x = undefined, y = undefined;
+    for (const a of args) {
+      if (a.startsWith('--app-url=')) url = a.split('=')[1];
+      if (a.startsWith('--win-w=')) w = parseInt(a.split('=')[1], 10) || 1280;
+      if (a.startsWith('--win-h=')) h = parseInt(a.split('=')[1], 10) || 820;
+      if (a.startsWith('--win-x=')) x = parseInt(a.split('=')[1], 10);
+      if (a.startsWith('--win-y=')) y = parseInt(a.split('=')[1], 10);
+    }
+
+    const opts = {
+      width: Math.max(600, w),
+      height: Math.max(420, h),
+      minWidth: 680,
+      minHeight: 480,
+      backgroundColor: '#0b0f19',
+      autoHideMenuBar: true,
+      icon: path.join(__dirname, 'logo.ico'),
+      title: 'Steam Switcher',
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    };
+    if (typeof x === 'number' && !isNaN(x) && typeof y === 'number' && !isNaN(y)) {
+      opts.x = x;
+      opts.y = y;
+    }
+
+    win = new BrowserWindow(opts);
+    win.setMenuBarVisibility(false);
+    win.loadURL(url);
+  });
+
+  app.on('window-all-closed', () => {
+    app.quit();
+  });
+}
+"""
+
+
+def ensure_electron_runtime():
+    exe_path = os.path.join(ELECTRON_RUNTIME_DIR, "electron.exe")
+    if not os.path.exists(exe_path):
+        # 1. Check local Electron cache on PC if available
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        cache_root = os.path.join(local_app_data, "electron", "Cache")
+        if os.path.isdir(cache_root):
+            for root, _, files in os.walk(cache_root):
+                for fn in files:
+                    if fn.startswith("electron-") and fn.endswith("-win32-x64.zip"):
+                        zp = os.path.join(root, fn)
+                        try:
+                            os.makedirs(ELECTRON_RUNTIME_DIR, exist_ok=True)
+                            with zipfile.ZipFile(zp, "r") as zf:
+                                zf.extractall(ELECTRON_RUNTIME_DIR)
+                            break
+                        except Exception:
+                            pass
+                if os.path.exists(exe_path):
+                    break
+
+    if not os.path.exists(exe_path):
+        # 2. Auto-bootstrap portable Electron v30.5.1 runtime on first run on a new PC
+        dl_url = "https://github.com/electron/electron/releases/download/v30.5.1/electron-v30.5.1-win32-x64.zip"
+        try:
+            os.makedirs(ELECTRON_RUNTIME_DIR, exist_ok=True)
+            req = urllib.request.Request(dl_url, headers={"User-Agent": "SteamSwitcher/2.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw_zip = resp.read()
+            with zipfile.ZipFile(io.BytesIO(raw_zip), "r") as zf:
+                zf.extractall(ELECTRON_RUNTIME_DIR)
+        except Exception:
+            pass
+
+    if os.path.exists(exe_path):
+        app_dir = os.path.join(ELECTRON_RUNTIME_DIR, "resources", "app")
+        main_js_path = os.path.join(app_dir, "main.js")
+        ico_path = os.path.join(app_dir, "logo.ico")
+        if not os.path.exists(main_js_path) or not os.path.exists(ico_path):
+            os.makedirs(app_dir, exist_ok=True)
+            try:
+                with open(os.path.join(app_dir, "package.json"), "w", encoding="utf-8") as f:
+                    json.dump({"name": "steam-switcher", "version": "2.0.0", "main": "main.js"}, f)
+                with open(main_js_path, "w", encoding="utf-8") as f:
+                    f.write(ELECTRON_MAIN_JS)
+                ico_bytes = LOGO_ICO_BYTES or _load_asset_bytes("logo.ico")
+                if ico_bytes:
+                    with open(ico_path, "wb") as f:
+                        f.write(ico_bytes)
+            except Exception:
+                pass
+        return exe_path
+    return None
+
+
+def open_app_window():
+    global ELECTRON_PROC
+    url = f"http://127.0.0.1:{PORT}"
+    ws = load_window_state()
+    w, h = ws.get("width", 1280), ws.get("height", 820)
+    x, y = ws.get("x"), ws.get("y")
+
+    electron_exe = ensure_electron_runtime()
+    if electron_exe and os.path.exists(electron_exe):
+        args = [
+            electron_exe,
+            f"--app-url={url}",
+            f"--win-w={w}",
+            f"--win-h={h}",
+        ]
+        if x is not None and y is not None:
+            args.append(f"--win-x={int(x)}")
+            args.append(f"--win-y={int(y)}")
+        ELECTRON_PROC = subprocess.Popen(
+            args,
+            cwd=ELECTRON_RUNTIME_DIR,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        return
+    os.startfile(url)
+
+
+def shutdown_application():
+    global TRAY_ICON, ELECTRON_PROC
+    try:
+        if ELECTRON_PROC is not None and ELECTRON_PROC.poll() is None:
+            ELECTRON_PROC.terminate()
+    except Exception:
+        pass
+    try:
+        if TRAY_ICON is not None:
+            TRAY_ICON.stop()
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def start_system_tray():
+    global TRAY_ICON
+    try:
+        import pystray
+        from PIL import Image
+        logo_bytes = LOGO_PNG_BYTES or _load_asset_bytes("logo.png")
+        if logo_bytes:
+            img = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+        else:
+            img = Image.new("RGBA", (64, 64), (59, 130, 246, 255))
+
+        def on_open(icon, item):
+            open_app_window()
+
+        def on_sync(icon, item):
+            def _bg_sync():
+                try:
+                    st = build_full_state()
+                    steam_path = st["steam_path"]
+                    accounts = parse_loginusers(steam_path)
+                    for g in st["games"]:
+                        if not g.get("cloud_enabled"):
+                            continue
+                        acc_info = accounts.get(g["owner_account"], {})
+                        sync_game_save(steam_path, g["appid"], acc_info, g["name"], direction="auto")
+                    build_full_state()
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_sync, daemon=True).start()
+
+        def on_exit(icon, item):
+            shutdown_application()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Buka Steam Switcher", on_open, default=True),
+            pystray.MenuItem("Sinkronkan Cloud Save", on_sync),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Keluar (Exit)", on_exit)
+        )
+        TRAY_ICON = pystray.Icon("SteamSwitcher", img, "Steam Switcher & Cloud Save", menu)
+        threading.Thread(target=TRAY_ICON.run, daemon=True).start()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    no_window = ("--no-window" in sys.argv) or ("--tray" in sys.argv)
+    if is_port_in_use(PORT):
+        if not no_window:
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{PORT}/api/open_window", data=b"{}", method="POST")
+                urllib.request.urlopen(req, timeout=1)
+            except Exception:
+                open_app_window()
+        sys.exit(0)
+
+    server = ThreadedHTTPServer(("127.0.0.1", PORT), LauncherRequestHandler)
+    threading.Thread(target=build_full_state, daemon=True).start()
+    if not no_window:
+        open_app_window()
+    start_system_tray()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        shutdown_application()
+

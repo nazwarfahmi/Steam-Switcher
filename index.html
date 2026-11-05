@@ -1,0 +1,1592 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Steam Switcher</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link id="faviconPng" rel="icon" type="image/png" href="/logo.png" />
+  <!--__INJECT_STATE__-->
+  <script>
+    (function() {
+      const savedTheme = localStorage.getItem("steam_switcher_theme") ||
+        (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.window_state && window.__INITIAL_STATE__.window_state.theme) ||
+        "dark";
+      document.documentElement.setAttribute("data-theme", savedTheme);
+    })();
+  </script>
+  <style>
+    :root[data-theme="dark"] {
+      --bg-base: #161618;
+      --bg-sidebar: #1c1c1f;
+      --bg-card: #222226;
+      --bg-input: #1c1c1f;
+      --bg-badge: rgba(24, 24, 27, 0.85);
+      --border: #2e2e34;
+      --border-active: #d4d4d8;
+      --text-main: #e4e4e7;
+      --text-muted: #9ca3af;
+      --text-dim: #71717a;
+      --btn-bg: #2a2a30;
+      --btn-text: #e4e4e7;
+      --btn-primary-bg: #e4e4e7;
+      --btn-primary-text: #18181b;
+      --glow: 0 0 12px rgba(228, 228, 231, 0.25);
+      --glow-border: rgba(228, 228, 231, 0.55);
+    }
+
+    :root[data-theme="light"] {
+      --bg-base: #f2f2f4;
+      --bg-sidebar: #e8e8ec;
+      --bg-card: #fcfcfd;
+      --bg-input: #fcfcfd;
+      --bg-badge: rgba(244, 244, 246, 0.9);
+      --border: #d4d4d8;
+      --border-active: #27272a;
+      --text-main: #27272a;
+      --text-muted: #52525b;
+      --text-dim: #71717a;
+      --btn-bg: #e4e4e7;
+      --btn-text: #27272a;
+      --btn-primary-bg: #27272a;
+      --btn-primary-text: #f4f4f5;
+      --glow: 0 0 12px rgba(39, 39, 42, 0.2);
+      --glow-border: rgba(39, 39, 42, 0.5);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+
+    html, body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      width: 100vw;
+      overflow: hidden;
+    }
+
+    /* SIDEBAR */
+    .sidebar {
+      width: 265px;
+      background-color: var(--bg-sidebar);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .brand {
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 11px;
+    }
+
+    .brand-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+
+    .brand-icon img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    .brand-text h1 {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      color: var(--text-main);
+    }
+
+    .sidebar-section-title {
+      padding: 16px 18px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.7px;
+      color: var(--text-dim);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .account-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .account-item {
+      padding: 11px 13px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      cursor: pointer;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+
+    .account-item:hover {
+      box-shadow: var(--glow);
+      border-color: var(--glow-border);
+    }
+
+    .account-item.selected {
+      border-color: var(--border-active);
+      box-shadow: var(--glow);
+    }
+
+    .acc-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .acc-name {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .active-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-main);
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    .acc-count-pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 99px;
+      background: var(--bg-base);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .acc-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 9px;
+    }
+
+    .btn-mini {
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      color: var(--text-main);
+      cursor: pointer;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+      font-weight: 500;
+    }
+
+    .btn-mini:hover {
+      box-shadow: var(--glow);
+      border-color: var(--glow-border);
+    }
+
+    /* MAIN CONTENT */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .topbar {
+      padding: 14px 22px;
+      background: var(--bg-sidebar);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .search-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 200px;
+      max-width: 340px;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 8px 14px 8px 32px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text-main);
+      font-size: 13px;
+      outline: none;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+
+    .search-input:focus,
+    .search-input:hover {
+      border-color: var(--glow-border);
+      box-shadow: var(--glow);
+    }
+
+    .search-icon {
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-dim);
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .icon-btn {
+      padding: 7px 11px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-main);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+
+    .icon-btn:hover {
+      border-color: var(--glow-border);
+      box-shadow: var(--glow);
+    }
+
+    .grid-header {
+      padding: 16px 22px 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .grid-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    /* GAME GRID */
+    .games-scroll-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 22px 32px;
+    }
+
+    .games-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+      grid-auto-rows: max-content;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .game-card {
+      position: relative;
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      min-height: 358px;
+      transition: box-shadow 0.15s ease, border-color 0.15s ease;
+      cursor: pointer;
+    }
+
+    .game-card:hover {
+      box-shadow: var(--glow);
+      border-color: var(--glow-border);
+    }
+
+    .poster-wrap {
+      position: relative;
+      width: 100%;
+      height: 245px;
+      flex-shrink: 0;
+      background: var(--bg-base);
+      overflow: hidden;
+    }
+
+    .poster-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    /* UNINSTALLED GAME EFFECT: DARK & GRAYSCALE */
+    .game-card.uninstalled .poster-img {
+      filter: grayscale(100%) brightness(38%) contrast(105%);
+    }
+
+    .badges-top-left {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 5px;
+    }
+
+    .badge-status {
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      text-transform: uppercase;
+      background: var(--bg-badge);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(6px);
+    }
+
+    .badge-profile {
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-size: 10.5px;
+      font-weight: 600;
+      background: var(--bg-badge);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(6px);
+    }
+
+    .badge-drive {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 3px 7px;
+      border-radius: 5px;
+      font-size: 10px;
+      font-weight: 600;
+      background: var(--bg-badge);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(6px);
+    }
+
+    .card-info {
+      padding: 10px 11px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      flex: 1;
+      justify-content: space-between;
+    }
+
+    .game-title {
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.3;
+      color: var(--text-main);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .game-card.uninstalled .game-title {
+      color: var(--text-muted);
+    }
+
+    .card-btn-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+    }
+
+    .cloud-check-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 2px 0;
+    }
+
+    .cloud-check-row:hover {
+      color: var(--text-main);
+    }
+
+    .cloud-check-row input {
+      width: 13.5px;
+      height: 13.5px;
+      accent-color: var(--text-main);
+      cursor: pointer;
+    }
+
+    .btn-play-main {
+      flex: 1;
+      padding: 7px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-text);
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+
+    .game-card.uninstalled .btn-play-main {
+      background: var(--btn-bg);
+      color: var(--btn-text);
+    }
+
+    .btn-play-main:hover {
+      box-shadow: var(--glow);
+      border-color: var(--glow-border);
+    }
+
+    .btn-play-main.is-running,
+    .btn-play-main.is-uploading {
+      background: var(--bg-base);
+      color: var(--text-main);
+      border-color: var(--border-active);
+      box-shadow: var(--glow);
+    }
+
+    .badge-status.is-running,
+    .badge-status.is-uploading {
+      border-color: var(--border-active);
+    }
+
+    .running-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      display: inline-block;
+      animation: pulseDot 1.4s infinite ease-in-out;
+    }
+
+    @keyframes pulseDot {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+
+    .btn-history-icon {
+      padding: 7px 9px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+
+    .btn-history-icon:hover {
+      color: var(--text-main);
+      box-shadow: var(--glow);
+      border-color: var(--glow-border);
+    }
+
+    .local-save-banner {
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      font-size: 11.5px;
+      color: var(--text-muted);
+      margin: 8px 0 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .history-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: none;
+      overflow: visible;
+      margin: 8px 0 14px;
+    }
+
+    .history-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      transition: border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+
+    .history-item.is-used {
+      border-color: #22c55e;
+      background: rgba(34, 197, 94, 0.08);
+    }
+
+    .history-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .history-title {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .badge-used {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 700;
+      background: rgba(34, 197, 94, 0.18);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, 0.45);
+    }
+
+    [data-theme="light"] .badge-used {
+      background: rgba(22, 163, 74, 0.14);
+      color: #15803d;
+      border-color: rgba(22, 163, 74, 0.4);
+    }
+
+    .btn-mini.is-used-btn {
+      border-color: rgba(34, 197, 94, 0.5);
+      color: #4ade80;
+      font-weight: 700;
+    }
+
+    [data-theme="light"] .btn-mini.is-used-btn {
+      color: #15803d;
+      border-color: rgba(22, 163, 74, 0.45);
+    }
+
+    .history-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .conflict-card {
+      padding: 11px 13px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      margin-bottom: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .conflict-card-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    .conflict-card-time {
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    /* TOAST */
+    .toast {
+      position: fixed;
+      bottom: 22px;
+      right: 22px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-active);
+      color: var(--text-main);
+      padding: 12px 16px;
+      border-radius: 9px;
+      box-shadow: var(--glow);
+      font-size: 12.5px;
+      font-weight: 600;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      z-index: 1000;
+    }
+
+    .toast.show {
+      display: flex;
+    }
+
+    /* CLOUD MODAL */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 950;
+    }
+
+    .modal-backdrop.show {
+      display: flex;
+    }
+
+    .modal-box {
+      width: 420px;
+      max-width: 92vw;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 20px;
+      box-shadow: var(--glow);
+    }
+
+    .modal-box h2 {
+      font-size: 15px;
+      margin-bottom: 14px;
+    }
+
+    .field {
+      margin-bottom: 12px;
+    }
+
+    .field label {
+      display: block;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 5px;
+    }
+
+    .field input {
+      width: 100%;
+      padding: 8px 11px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text-main);
+      font-size: 12.5px;
+      outline: none;
+    }
+
+    .field input:focus {
+      border-color: var(--glow-border);
+      box-shadow: var(--glow);
+    }
+
+    .modal-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 13px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      margin-bottom: 10px;
+      cursor: pointer;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+
+    .setting-row:hover {
+      border-color: var(--glow-border);
+      box-shadow: var(--glow);
+    }
+
+    .setting-info {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .setting-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .setting-desc {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .setting-check {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--text-main);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">
+        <img id="sidebarLogoImg" src="/logo.png" alt="Logo" />
+      </div>
+      <div class="brand-text">
+        <h1>Steam Switcher</h1>
+      </div>
+    </div>
+
+    <div class="sidebar-section-title">
+      <span>Akun Steam</span>
+      <span id="totalAccountsBadge">0</span>
+    </div>
+
+    <div class="account-list" id="accountList"></div>
+  </aside>
+
+  <!-- MAIN AREA -->
+  <main class="main">
+    <header class="topbar">
+      <div class="search-wrap">
+        <span class="search-icon">🔍</span>
+        <input
+          type="text"
+          id="searchInput"
+          class="search-input"
+          placeholder="Cari nama game..."
+          oninput="renderGames()"
+        />
+      </div>
+
+      <div class="topbar-right">
+        <button class="icon-btn" id="cloudBtn" onclick="openCloudModal()" title="Akun Cloud Save">
+          ☁ Login Cloud
+        </button>
+        <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="Ganti Tema">
+          Tema
+        </button>
+        <button class="icon-btn" onclick="openSettingsModal()" title="Pengaturan">
+          ⚙
+        </button>
+        <button class="icon-btn" onclick="refreshState()" title="Segarkan">
+          ↻
+        </button>
+      </div>
+    </header>
+
+    <div class="grid-header">
+      <div class="grid-title" id="currentViewTitle">Daftar Game (Semua Akun)</div>
+    </div>
+
+    <div class="games-scroll-area">
+      <div class="games-container" id="gamesGrid"></div>
+    </div>
+  </main>
+
+  <!-- CLOUD SETTINGS MODAL -->
+  <div class="modal-backdrop" id="cloudModal" onclick="if(event.target===this)closeCloudModal()">
+    <div class="modal-box">
+      <h2 id="cloudModalTitle">Akun Cloud Save</h2>
+      <div class="field">
+        <label>Server URL</label>
+        <input type="text" id="cloudUrlInput" value="" placeholder="Contoh: https://cloud.domain-kamu.com atau http://IP-VPS:8765" />
+      </div>
+      <div class="field">
+        <label>Username</label>
+        <input type="text" id="cloudUserInput" placeholder="Masukkan username..." />
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="cloudPassInput" placeholder="Masukkan password..." />
+      </div>
+      <div class="modal-footer" style="flex-wrap:wrap;gap:8px;">
+        <div style="display:flex;gap:6px;" id="cloudLoggedActions">
+          <button class="icon-btn" onclick="syncAllCloudNow()">↻ Sinkronkan</button>
+          <button class="icon-btn" onclick="submitCloudAuth('logout')">Logout</button>
+        </div>
+        <div style="display:flex;gap:6px;margin-left:auto;">
+          <button class="icon-btn" onclick="closeCloudModal()">Tutup</button>
+          <button class="icon-btn" onclick="submitCloudAuth('register')">Register</button>
+          <button class="icon-btn" style="background:var(--btn-primary-bg);color:var(--btn-primary-text);" onclick="submitCloudAuth('login')">Login</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SAVE CONFLICT MODAL (LOCAL NEWER THAN CLOUD) -->
+  <div class="modal-backdrop" id="conflictModal" onclick="if(event.target===this)closeConflictModal()">
+    <div class="modal-box" style="width:450px;">
+      <h2>File Save Lokal Lebih Baru</h2>
+      <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:13px;line-height:1.45;">
+        File save <strong id="conflictGameName" style="color:var(--text-main);">Game</strong> di komputer ini lebih baru daripada versi di Cloud. Pilih save mana yang ingin digunakan:
+      </div>
+      <div class="conflict-card">
+        <div class="conflict-card-title">Save Lokal (Komputer Ini — Lebih Baru)</div>
+        <div class="conflict-card-time" id="conflictLocalTime">-</div>
+      </div>
+      <div class="conflict-card">
+        <div class="conflict-card-title" id="conflictCloudTitle">Save Cloud</div>
+        <div class="conflict-card-time" id="conflictCloudTime">-</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:14px;">
+        <button class="btn-play-main" style="padding:9px 12px;" onclick="resolveConflict('local')">
+          Gunakan Save Lokal (Upload ke Cloud & Main)
+        </button>
+        <button class="icon-btn" style="width:100%;padding:9px 12px;" onclick="resolveConflict('cloud')">
+          Gunakan Save Cloud (Timpa Lokal & Main)
+        </button>
+        <button class="icon-btn" style="width:100%;padding:7px 12px;color:var(--text-muted);" onclick="closeConflictModal()">
+          Batal
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SAVE HISTORY MODAL (MAX 5 VERSIONS) -->
+  <div class="modal-backdrop" id="historyModal" onclick="if(event.target===this)closeHistoryModal()">
+    <div class="modal-box" style="width:540px;max-width:94vw;padding:22px 24px;">
+      <h2 id="historyModalTitle">Riwayat Cloud Save (Maks 5)</h2>
+      <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:6px;">
+        Menyimpan maksimal 5 versi terakhir di Cloud secara otomatis (langsung dibandingkan dengan folder save Steam).
+      </div>
+      <div class="local-save-banner" id="historyLocalBanner" style="display:none;"></div>
+      <div class="history-list" id="historyListBox"></div>
+      <div class="modal-footer" style="justify-content:flex-end;">
+        <button class="icon-btn" onclick="closeHistoryModal()">Tutup</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- APP SETTINGS MODAL -->
+  <div class="modal-backdrop" id="settingsModal" onclick="if(event.target===this)closeSettingsModal()">
+    <div class="modal-box" style="width:430px;">
+      <h2>Pengaturan Aplikasi</h2>
+      <label class="setting-row" for="chkHideToTray">
+        <div class="setting-info">
+          <div class="setting-title">On exit hide to tray</div>
+          <div class="setting-desc">Saat tombol X diklik, sembunyikan aplikasi ke System Tray Windows.</div>
+        </div>
+        <input type="checkbox" class="setting-check" id="chkHideToTray" onchange="saveAppSettings()" />
+      </label>
+      <label class="setting-row" for="chkStartupTray">
+        <div class="setting-info">
+          <div class="setting-title">Start at Windows startup (tray)</div>
+          <div class="setting-desc">Jalankan otomatis di System Tray saat komputer dinyalakan.</div>
+        </div>
+        <input type="checkbox" class="setting-check" id="chkStartupTray" onchange="saveAppSettings()" />
+      </label>
+      <div class="modal-footer" style="justify-content:flex-end;">
+        <button class="icon-btn" onclick="closeSettingsModal()">Tutup</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST -->
+  <div class="toast" id="toastBox">
+    <span id="toastText">Memproses...</span>
+  </div>
+
+  <script>
+    let appState = window.__INITIAL_STATE__ || {
+      steam_running: false,
+      active_account: "",
+      accounts: [],
+      games: [],
+      window_state: {}
+    };
+    let selectedAccount =
+      localStorage.getItem("steam_switcher_selected_account") ||
+      (appState.window_state && appState.window_state.selected_account) ||
+      "ALL";
+
+    function updateThemeBtnLabel(theme) {
+      const btn = document.getElementById("themeBtn");
+      if (btn) {
+        btn.textContent = theme === "dark" ? "☀ Terang" : "☾ Gelap";
+      }
+    }
+
+    function toggleTheme() {
+      const cur = document.documentElement.getAttribute("data-theme") || "dark";
+      const next = cur === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      localStorage.setItem("steam_switcher_theme", next);
+      updateThemeBtnLabel(next);
+      saveWindowBounds();
+    }
+
+    function getBoundsPayload() {
+      return {
+        width: window.outerWidth,
+        height: window.outerHeight,
+        x: window.screenX,
+        y: window.screenY,
+        theme: document.documentElement.getAttribute("data-theme") || "dark",
+        selected_account: selectedAccount
+      };
+    }
+
+    function saveWindowBounds() {
+      if (window.outerWidth < 400 || window.outerHeight < 300) return;
+      const bounds = getBoundsPayload();
+      localStorage.setItem("steam_switcher_bounds", JSON.stringify(bounds));
+      fetch("/api/window_bounds", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bounds),
+        keepalive: true
+      }).catch(() => {});
+    }
+
+    let boundsTimer = null;
+    window.addEventListener("resize", () => {
+      if (boundsTimer) clearTimeout(boundsTimer);
+      boundsTimer = setTimeout(saveWindowBounds, 250);
+    });
+    window.addEventListener("beforeunload", () => {
+      const bounds = (window.outerWidth >= 400 && window.outerHeight >= 300) ? getBoundsPayload() : {};
+      fetch("/api/window_closed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bounds),
+        keepalive: true
+      }).catch(() => {});
+    });
+
+    function openSettingsModal() {
+      const ws = appState.window_state || {};
+      document.getElementById("chkHideToTray").checked = ws.hide_to_tray_on_exit !== false;
+      document.getElementById("chkStartupTray").checked = Boolean(ws.start_at_startup_tray);
+      document.getElementById("settingsModal").classList.add("show");
+    }
+
+    function closeSettingsModal() {
+      document.getElementById("settingsModal").classList.remove("show");
+    }
+
+    async function saveAppSettings() {
+      const hide_to_tray_on_exit = document.getElementById("chkHideToTray").checked;
+      const start_at_startup_tray = document.getElementById("chkStartupTray").checked;
+      if (!appState.window_state) appState.window_state = {};
+      appState.window_state.hide_to_tray_on_exit = hide_to_tray_on_exit;
+      appState.window_state.start_at_startup_tray = start_at_startup_tray;
+      try {
+        await fetch("/api/window_bounds", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ hide_to_tray_on_exit, start_at_startup_tray })
+        });
+        showToast("Pengaturan berhasil disimpan!", 2500);
+      } catch (e) {
+        showToast("Gagal menyimpan pengaturan.");
+      }
+    }
+
+    function showToast(msg, duration = 3500) {
+      const box = document.getElementById("toastBox");
+      document.getElementById("toastText").textContent = msg;
+      box.classList.add("show");
+      if (window._toastTimeout) clearTimeout(window._toastTimeout);
+      window._toastTimeout = setTimeout(() => {
+        box.classList.remove("show");
+      }, duration);
+    }
+
+    function applyState(st) {
+      appState = st;
+      if (st.logo_src) {
+        const sLogo = document.getElementById("sidebarLogoImg");
+        if (sLogo) sLogo.src = st.logo_src;
+        const fav = document.getElementById("faviconPng");
+        if (fav) fav.href = st.logo_src;
+      }
+      appState.accounts.sort((a, b) => a.account_name.localeCompare(b.account_name, undefined, { sensitivity: "base" }));
+      appState.games.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+      if (selectedAccount !== "ALL" && !appState.accounts.some(a => a.account_name === selectedAccount)) {
+        selectedAccount = "ALL";
+      }
+      const cbtn = document.getElementById("cloudBtn");
+      const ccfg = appState.cloud_config || {};
+      if (cbtn) {
+        cbtn.textContent = ccfg.username ? `☁ ${ccfg.username}` : "☁ Login Cloud";
+      }
+      renderSidebar();
+      renderGames();
+    }
+
+    async function refreshState() {
+      try {
+        const res = await fetch("/api/state");
+        const st = await res.json();
+        applyState(st);
+      } catch (e) {
+        showToast("Gagal memuat data dari server lokal.");
+      }
+    }
+
+    function renderSidebar() {
+      document.getElementById("totalAccountsBadge").textContent = appState.accounts.length;
+
+      const listEl = document.getElementById("accountList");
+      const totalInst = appState.games.filter(g => g.installed).length;
+
+      let html = `
+        <div class="account-item ${selectedAccount === 'ALL' ? 'selected' : ''}" onmousedown="selectAccount('ALL')" onclick="selectAccount('ALL')">
+          <div class="acc-top">
+            <div class="acc-name">Semua Akun</div>
+            <span class="acc-count-pill">${totalInst} / ${appState.games.length}</span>
+          </div>
+        </div>
+      `;
+
+      for (const acc of appState.accounts) {
+        const isSel = selectedAccount === acc.account_name;
+        const isCurrent = acc.is_active;
+        html += `
+          <div class="account-item ${isSel ? 'selected' : ''}" onmousedown="handleAccountCardMouseDown(event, '${acc.account_name}')" onclick="handleAccountCardMouseDown(event, '${acc.account_name}')">
+            <div class="acc-top">
+              <div class="acc-name">
+                ${isCurrent ? '<span class="active-dot" title="Akun Aktif"></span>' : ''}
+                <span>${acc.account_name}</span>
+              </div>
+              <span class="acc-count-pill">${acc.installed_count} / ${acc.total_count}</span>
+            </div>
+            <div class="acc-actions">
+              <button class="btn-mini" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); switchAccountOnly('${acc.account_name}')">
+                Buka Steam
+              </button>
+              <button
+                class="btn-mini"
+                onmousedown="event.stopPropagation()"
+                onclick="event.stopPropagation(); toggleOfflineMode('${acc.account_name}', ${!acc.offline_mode})"
+              >
+                ${acc.offline_mode ? 'Offline' : 'Online'}
+              </button>
+            </div>
+          </div>
+        `;
+      }
+
+      listEl.innerHTML = html;
+    }
+
+    function handleAccountCardMouseDown(e, accName) {
+      if (e && e.target && e.target.closest("button")) return;
+      selectAccount(accName);
+    }
+
+    function selectAccount(accName) {
+      if (selectedAccount === accName) return;
+      selectedAccount = accName;
+      localStorage.setItem("steam_switcher_selected_account", accName);
+      renderSidebar();
+      renderGames();
+      saveWindowBounds();
+    }
+
+    function renderGames() {
+      const q = document.getElementById("searchInput").value.trim().toLowerCase();
+      const titleEl = document.getElementById("currentViewTitle");
+
+      if (selectedAccount === "ALL") {
+        titleEl.textContent = "Daftar Game (Semua Akun)";
+      } else {
+        titleEl.textContent = `Daftar Game (${selectedAccount})`;
+      }
+
+      let finalGames = appState.games.filter(g => {
+        if (selectedAccount === "ALL") return true;
+        return g.owner_account === selectedAccount;
+      });
+
+      if (q) {
+        finalGames = finalGames.filter(g =>
+          g.name.toLowerCase().includes(q)
+        );
+      }
+
+      const grid = document.getElementById("gamesGrid");
+      if (finalGames.length === 0) {
+        grid.innerHTML = `
+          <div style="grid-column: 1 / -1; text-align:center; padding: 60px 20px; color: var(--text-muted);">
+            <div style="font-size: 14px; font-weight: 600;">Tidak ada game yang ditemukan</div>
+          </div>
+        `;
+        return;
+      }
+
+      grid.innerHTML = finalGames.map(g => {
+        const isRun = Boolean(g.running);
+        const isUp = Boolean(g.uploading);
+        const stateClass = g.installed ? "installed" : "uninstalled";
+        const statusText = isRun
+          ? "Running"
+          : (isUp ? "Upload to Cloud" : (g.installed ? "Terinstal" : "Belum Terinstal"));
+        const driveHtml = (g.installed && g.drive)
+          ? `<span class="badge-drive">${g.drive} ${g.size_gb ? '• ' + g.size_gb + ' GB' : ''}</span>`
+          : "";
+        const btnContent = isRun
+          ? `<span class="running-dot"></span><span>Running</span>`
+          : (isUp
+              ? `<span class="running-dot"></span><span>Upload to Cloud</span>`
+              : (g.installed ? "Main" : "Install"));
+        const safeName = g.name.replace(/'/g, "\\'");
+
+        return `
+          <div class="game-card ${stateClass}" data-appid="${g.appid}" onclick="launchGame('${g.appid}', '${g.owner_account}', ${!g.installed}, '${safeName}')">
+            <div class="poster-wrap">
+              <img
+                class="poster-img"
+                decoding="sync"
+                src="${g.cover_src || ('/api/cover/' + g.appid)}"
+                onerror="this.onerror=null; this.src='https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.appid}/header.jpg';"
+                alt="${g.name}"
+              />
+              <div class="badges-top-left">
+                <span class="badge-status ${isRun ? 'is-running' : (isUp ? 'is-uploading' : '')}" id="badge-status-${g.appid}">${statusText}</span>
+                <span class="badge-profile">${g.owner_account}</span>
+              </div>
+              ${driveHtml}
+            </div>
+            <div class="card-info">
+              <div class="game-title" title="${g.name}">${g.name}</div>
+              <div style="display:flex;flex-direction:column;gap:7px;">
+                <label class="cloud-check-row" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()">
+                  <input
+                    type="checkbox"
+                    ${g.cloud_enabled ? 'checked' : ''}
+                    onchange="toggleGameCloud('${g.appid}', this.checked, '${safeName}')"
+                  />
+                  <span>Cloud Save</span>
+                </label>
+                <div class="card-btn-row">
+                  <button class="btn-play-main ${isRun ? 'is-running' : (isUp ? 'is-uploading' : '')}" id="btn-play-${g.appid}">${btnContent}</button>
+                  <button
+                    class="btn-history-icon"
+                    title="Riwayat Cloud Save (Maks 5)"
+                    onmousedown="event.stopPropagation()"
+                    onclick="event.stopPropagation(); openHistoryModal('${g.appid}', '${g.owner_account}', '${safeName}')"
+                  >☁</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function toggleGameCloud(appid, enabled, gameName) {
+      const gObj = appState.games.find(x => String(x.appid) === String(appid));
+      if (gObj) gObj.cloud_enabled = enabled;
+      if (enabled && gObj && gObj.installed && !gObj.running) {
+        updateGameRunningDom(appid, false, true);
+      }
+      try {
+        const res = await fetch("/api/toggle_game_cloud", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, enabled, game_name: gameName })
+        });
+        const data = await res.json();
+        if (data.uploading) {
+          updateGameRunningDom(appid, false, true);
+        }
+        showToast(data.message || "Pengaturan Cloud Save diperbarui.", 3000);
+      } catch (e) {
+        showToast("Gagal memperbarui pengaturan Cloud Save.");
+      }
+    }
+
+    let pendingConflict = null;
+    let activeHistoryContext = null;
+    const shownUploadTs = {};
+
+    function updateGameRunningDom(appid, isRunning, isUploading = false) {
+      const gObj = appState.games.find(x => String(x.appid) === String(appid));
+      if (gObj) {
+        gObj.running = isRunning;
+        gObj.uploading = isUploading;
+      }
+      const btn = document.getElementById(`btn-play-${appid}`);
+      const badge = document.getElementById(`badge-status-${appid}`);
+      if (btn) {
+        btn.classList.remove("is-running", "is-uploading");
+        if (isRunning) {
+          btn.classList.add("is-running");
+          btn.innerHTML = `<span class="running-dot"></span><span>Running</span>`;
+        } else if (isUploading) {
+          btn.classList.add("is-uploading");
+          btn.innerHTML = `<span class="running-dot"></span><span>Upload to Cloud</span>`;
+        } else {
+          btn.textContent = (gObj && !gObj.installed) ? "Install" : "Main";
+        }
+      }
+      if (badge) {
+        badge.classList.remove("is-running", "is-uploading");
+        if (isRunning) {
+          badge.classList.add("is-running");
+          badge.textContent = "Running";
+        } else if (isUploading) {
+          badge.classList.add("is-uploading");
+          badge.textContent = "Upload to Cloud";
+        } else {
+          badge.textContent = (gObj && !gObj.installed) ? "Belum Terinstal" : "Terinstal";
+        }
+      }
+    }
+
+    async function pollRunningStatus() {
+      try {
+        const res = await fetch("/api/running");
+        const data = await res.json();
+        if (!data || !data.ok) return;
+        const runSet = new Set((data.running_appids || []).map(String));
+        const upSet = new Set((data.uploading_appids || []).map(String));
+        const lastUploads = data.last_uploads || {};
+        let needRefresh = false;
+
+        for (const g of appState.games) {
+          const aid = String(g.appid);
+          const nowRun = runSet.has(aid);
+          let nowUp = upSet.has(aid);
+          const wasRun = Boolean(g.running);
+          const wasUp = Boolean(g.uploading);
+
+          // When game just stopped running and Cloud Save is checked, immediately transition to Upload to Cloud
+          if (wasRun && !nowRun && g.cloud_enabled) {
+            nowUp = true;
+          }
+
+          if (nowRun !== wasRun || nowUp !== wasUp) {
+            updateGameRunningDom(aid, nowRun, nowUp);
+            if ((wasRun && !nowRun) || (wasUp && !nowUp)) {
+              needRefresh = true;
+            }
+          }
+
+          const upInfo = lastUploads[aid];
+          if (upInfo && upInfo.ts && shownUploadTs[aid] !== upInfo.ts) {
+            shownUploadTs[aid] = upInfo.ts;
+            if (upInfo.message && (upInfo.action === "uploaded" || upInfo.action === "downloaded")) {
+              showToast(upInfo.message, 4000);
+            }
+          }
+        }
+        if (needRefresh) {
+          setTimeout(refreshState, 2500);
+        }
+      } catch (e) {}
+    }
+
+    setInterval(pollRunningStatus, 1500);
+
+    function formatUnixTime(sec) {
+      if (!sec) return "-";
+      const d = new Date(sec * 1000);
+      return d.toLocaleString("id-ID", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      });
+    }
+
+    async function launchGame(appid, account, installMode, gameName, conflictChoice = "") {
+      if (!account) {
+        showToast("Akun tidak ditemukan untuk game ini!");
+        return;
+      }
+      const gObj = appState.games.find(x => String(x.appid) === String(appid));
+      if (gObj && gObj.running && !conflictChoice) {
+        showToast(`${gameName} sedang berjalan (Running) di Steam.`, 3000);
+        return;
+      }
+      if (gObj && gObj.uploading && !conflictChoice) {
+        showToast(`Sedang meng-upload save ${gameName} ke Cloud...`, 3000);
+        return;
+      }
+      const actionWord = installMode ? "Membuka Install" : "Sinkronisasi Save & Menjalankan";
+      showToast(`Mengatur akun '${account}' • ${actionWord} ${gameName}...`, 5000);
+
+      try {
+        const res = await fetch("/api/launch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            appid,
+            account,
+            install_mode: installMode,
+            game_name: gameName,
+            conflict_choice: conflictChoice
+          })
+        });
+        const data = await res.json();
+        if (data.conflict) {
+          pendingConflict = { appid, account, installMode, gameName };
+          document.getElementById("conflictGameName").textContent = gameName;
+          document.getElementById("conflictLocalTime").textContent = `Diubah pada: ${formatUnixTime(data.local_mtime)}`;
+          document.getElementById("conflictCloudTitle").textContent = `Save Cloud (${data.cloud_device || 'Server'})`;
+          document.getElementById("conflictCloudTime").textContent = `Diubah pada: ${formatUnixTime(data.cloud_mtime)}`;
+          document.getElementById("conflictModal").classList.add("show");
+          document.getElementById("toastBox").classList.remove("show");
+          return;
+        }
+        if (data.ok && !installMode) {
+          updateGameRunningDom(appid, true);
+        }
+        showToast(data.message || "Berhasil!", 4500);
+        await refreshState();
+        setTimeout(refreshState, 1500);
+      } catch (e) {
+        showToast("Gagal menghubungi server lokal.");
+      }
+    }
+
+    function closeConflictModal() {
+      document.getElementById("conflictModal").classList.remove("show");
+      pendingConflict = null;
+    }
+
+    function resolveConflict(choice) {
+      const ctx = pendingConflict;
+      closeConflictModal();
+      if (!ctx) return;
+      launchGame(ctx.appid, ctx.account, ctx.installMode, ctx.gameName, choice);
+    }
+
+    async function openHistoryModal(appid, account, gameName) {
+      activeHistoryContext = { appid, account, gameName };
+      document.getElementById("historyModalTitle").textContent = `Riwayat Save: ${gameName}`;
+      const box = document.getElementById("historyListBox");
+      const banner = document.getElementById("historyLocalBanner");
+      if (banner) banner.style.display = "none";
+      box.innerHTML = `<div style="padding:18px;text-align:center;color:var(--text-muted);font-size:12px;">Memuat & membandingkan folder save Steam dengan Cloud...</div>`;
+      document.getElementById("historyModal").classList.add("show");
+
+      try {
+        const res = await fetch("/api/save_history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, account })
+        });
+        const data = await res.json();
+        const list = (data && data.history) || [];
+        const localSave = (data && data.local_save) || {};
+
+        if (banner) {
+          banner.style.display = "flex";
+          if (!localSave.exists) {
+            banner.innerHTML = `<span>Folder Save Steam: <strong>Belum ada file save di PC ini</strong></span>`;
+          } else if (localSave.matched && localSave.matched_index) {
+            banner.innerHTML = `<span>Folder Save Steam: <strong style="color:#4ade80;">Sinkron dengan Versi #${localSave.matched_index}</strong></span><span>${formatUnixTime(localSave.mtime)}</span>`;
+          } else {
+            banner.innerHTML = `<span>Folder Save Steam: <strong style="color:var(--text-main);">Save Lokal Berbeda / Belum Di-upload</strong></span><span>${formatUnixTime(localSave.mtime)}</span>`;
+          }
+        }
+
+        if (list.length === 0) {
+          box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12.5px;">Belum ada riwayat save di Cloud untuk game ini.</div>`;
+          return;
+        }
+        box.innerHTML = list.map((item, idx) => {
+          const isUsed = Boolean(item.is_used);
+          return `
+            <div class="history-item ${isUsed ? 'is-used' : ''}">
+              <div class="history-meta">
+                <div class="history-title">
+                  <span>#${idx + 1} • ${item.label}</span>
+                  ${isUsed ? '<span class="badge-used">✓ Sedang Digunakan</span>' : ''}
+                </div>
+                <div class="history-sub">${formatUnixTime(item.mtime)} • ${item.size_kb} KB</div>
+              </div>
+              <button
+                class="btn-mini ${isUsed ? 'is-used-btn' : ''}"
+                onclick="restoreHistoryVersion('${item.source}', '${item.filename}', ${item.mtime || 0})"
+              >${isUsed ? '✓ Digunakan' : 'Pulihkan'}</button>
+            </div>
+          `;
+        }).join("");
+      } catch (e) {
+        box.innerHTML = `<div style="padding:18px;text-align:center;color:var(--text-muted);font-size:12px;">Gagal memuat riwayat save.</div>`;
+      }
+    }
+
+    function closeHistoryModal() {
+      document.getElementById("historyModal").classList.remove("show");
+    }
+
+    async function restoreHistoryVersion(source, filename, mtime = 0) {
+      if (!activeHistoryContext) return;
+      const { appid, account, gameName } = activeHistoryContext;
+      showToast(`Memulihkan versi save ${gameName} ke folder Steam...`, 4500);
+      try {
+        const res = await fetch("/api/restore_save_history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, account, game_name: gameName, source, filename, mtime })
+        });
+        const data = await res.json();
+        showToast(data.message || "Berhasil dipulihkan!", 4500);
+        if (data.ok) {
+          await openHistoryModal(appid, account, gameName);
+          await refreshState();
+        }
+      } catch (e) {
+        showToast("Gagal memulihkan versi save.");
+      }
+    }
+
+    function openCloudModal() {
+      const cfg = appState.cloud_config || {};
+      document.getElementById("cloudUrlInput").value = cfg.server_url || "";
+      document.getElementById("cloudUserInput").value = cfg.username || "";
+      document.getElementById("cloudPassInput").value = cfg.password || "";
+      const isLogged = Boolean(cfg.username);
+      document.getElementById("cloudLoggedActions").style.display = isLogged ? "flex" : "none";
+      document.getElementById("cloudModalTitle").textContent = isLogged
+        ? `Cloud Save (Login: ${cfg.username})`
+        : "Login / Register Cloud Save";
+      document.getElementById("cloudModal").classList.add("show");
+    }
+
+    function closeCloudModal() {
+      document.getElementById("cloudModal").classList.remove("show");
+    }
+
+    async function submitCloudAuth(action) {
+      const server_url = document.getElementById("cloudUrlInput").value.trim();
+      const username = document.getElementById("cloudUserInput").value.trim();
+      const password = document.getElementById("cloudPassInput").value.trim();
+      showToast("Memproses akun Cloud...", 4000);
+      try {
+        const res = await fetch("/api/cloud_auth", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, server_url, username, password })
+        });
+        const data = await res.json();
+        showToast(data.message || "Berhasil!", 4000);
+        if (data.ok) {
+          closeCloudModal();
+          await refreshState();
+        }
+      } catch (e) {
+        showToast("Gagal menghubungi server lokal.");
+      }
+    }
+
+    async function syncAllCloudNow() {
+      showToast("Menyinkronkan seluruh save game dengan Server Cloud...", 6000);
+      try {
+        const res = await fetch("/api/cloud_sync_all", { method: "POST" });
+        const data = await res.json();
+        showToast(data.message || "Sinkronisasi selesai!", 4500);
+        await refreshState();
+      } catch (e) {
+        showToast("Gagal melakukan sinkronisasi Cloud.");
+      }
+    }
+
+    async function switchAccountOnly(account) {
+      selectAccount(account);
+      showToast(`Mengganti akun Steam ke '${account}'...`, 4500);
+      try {
+        const res = await fetch("/api/switch_account", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ account })
+        });
+        const data = await res.json();
+        showToast(data.message || "Akun berhasil diganti!", 4000);
+        await refreshState();
+        setTimeout(refreshState, 1500);
+      } catch (e) {
+        showToast("Gagal mengganti akun.");
+      }
+    }
+
+    async function toggleOfflineMode(account, offline) {
+      try {
+        const res = await fetch("/api/toggle_offline", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ account, offline })
+        });
+        const data = await res.json();
+        showToast(data.message);
+        await refreshState();
+      } catch (e) {
+        showToast("Gagal mengubah mode offline.");
+      }
+    }
+
+    // Synchronous instant render on Frame 1 (Zero blink / Zero network wait)
+    updateThemeBtnLabel(document.documentElement.getAttribute("data-theme") || "dark");
+    if (appState && appState.accounts && appState.accounts.length > 0) {
+      applyState(appState);
+    } else {
+      refreshState();
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Python & Build Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+build_tmp/
+dist/
+*.spec
+SteamSwitcher.exe
+*.exe
+
+# Cloud Server Data (User Accounts & Uploaded Saves)
+cloud-server/saves_data/
+
+# Local OS / Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
