@@ -45,12 +45,17 @@ STATE_CACHE = None
 COVER_CACHE = {}
 COVER_B64_CACHE = {}
 UFS_CACHE = {}
+SCHEMA_CACHE = {}
 CACHE_LOCK = threading.Lock()
 ACTIVE_WATCHERS = set()
 LAUNCHING_UNTIL = {}
 UPLOADING_APPIDS = set()
 UPLOADING_UNTIL = {}
 LAST_UPLOAD_MSG = {}
+LAST_ACHIEVEMENT_UNLOCK = {}
+ACHIEVEMENT_POPUP_QUEUE = []
+POPUP_LOCK = threading.Lock()
+CLOUD_ACH_APPID = "999999999"
 LAST_UI_ACTIVITY_TS = time.time()
 TRAY_ICON = None
 
@@ -73,14 +78,15 @@ LOGO_B64_URI = (
 )
 
 NON_GAME_APPIDS = {
-    "228980",  # Steamworks Common Redistributables
-    "2371090", # Steam Game Notes
-    "241100",  # Steam Controller Configs
-    "250820",  # SteamVR
-    "769",     # Steamworks SDK
-    "1070560", # Steam Linux Runtime
-    "1391110", # Steam Linux Runtime - Soldier
-    "1628350", # Steam Linux Runtime - Sniper
+    "228980",    # Steamworks Common Redistributables
+    "2371090",   # Steam Game Notes
+    "241100",    # Steam Controller Configs
+    "250820",    # SteamVR
+    "769",       # Steamworks SDK
+    "1070560",   # Steam Linux Runtime
+    "1391110",   # Steam Linux Runtime - Soldier
+    "1628350",   # Steam Linux Runtime - Sniper
+    "999999999", # Internal Cloud Achievement Sync Bundle
 }
 
 def _reg_read_json(value_name):
@@ -166,6 +172,473 @@ def update_sync_state(username, appid, files_sha256, cloud_sha256, mtime, active
 def get_last_sync_record(username, appid):
     st = load_sync_state()
     return st.get(f"{(username or '').lower()}:{appid}", {})
+
+def _get_active_ach_profile():
+    cfg = load_cloud_config()
+    u = (cfg.get("username") or "").strip().lower()
+    return u if u else "_local"
+
+def load_personal_achievements_raw():
+    data = _reg_read_json("PersonalAchievements")
+    if not isinstance(data, dict):
+        data = {}
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+        # Migrate legacy top-level appid maps into _local and active profile
+        legacy = {k: v for k, v in data.items() if str(k).isdigit() and isinstance(v, dict)}
+        if legacy:
+            profiles["_local"] = dict(legacy)
+            prof = _get_active_ach_profile()
+            if prof != "_local":
+                profiles[prof] = dict(legacy)
+        data = {"profiles": profiles, "reset_at": {}}
+        _reg_write_json("PersonalAchievements", data)
+    if not isinstance(data.get("reset_at"), dict):
+        data["reset_at"] = {}
+    return data
+
+def save_personal_achievements_raw(data):
+    if isinstance(data, dict):
+        _reg_write_json("PersonalAchievements", data)
+
+def get_game_personal_achievements(appid):
+    raw = load_personal_achievements_raw()
+    prof = _get_active_ach_profile()
+    prof_map = raw["profiles"].get(prof)
+    if prof_map is None and prof != "_local" and "_local" in raw["profiles"]:
+        # Copy _local achievements on first login if profile empty
+        prof_map = dict(raw["profiles"]["_local"])
+        raw["profiles"][prof] = prof_map
+        save_personal_achievements_raw(raw)
+    if not isinstance(prof_map, dict):
+        return {}
+    game_ach = prof_map.get(str(appid), {})
+    return dict(game_ach) if isinstance(game_ach, dict) else {}
+
+def get_game_reset_timestamp(appid):
+    raw = load_personal_achievements_raw()
+    prof = _get_active_ach_profile()
+    return int((raw.get("reset_at", {}).get(prof, {}) or {}).get(str(appid), 0) or 0)
+
+def set_game_personal_achievements(appid, ach_map, mark_reset=False):
+    raw = load_personal_achievements_raw()
+    prof = _get_active_ach_profile()
+    prof_map = raw["profiles"].setdefault(prof, {})
+    clean_map = {}
+    if isinstance(ach_map, dict):
+        for k, v in ach_map.items():
+            try:
+                clean_map[str(k)] = int(v)
+            except Exception:
+                pass
+    prof_map[str(appid)] = clean_map
+    if mark_reset:
+        rst_prof = raw["reset_at"].setdefault(prof, {})
+        rst_prof[str(appid)] = int(time.time())
+    save_personal_achievements_raw(raw)
+    return clean_map
+
+def enqueue_achievement_popup(appid, game_name, ach_item, unlocked_count, total_count):
+    with POPUP_LOCK:
+        ACHIEVEMENT_POPUP_QUEUE.append({
+            "id": f"{appid}:{ach_item.get('key', '')}:{int(time.time()*1000)}",
+            "appid": str(appid),
+            "game_name": game_name or f"App {appid}",
+            "key": ach_item.get("key", ""),
+            "title": ach_item.get("title", "Achievement Unlocked"),
+            "description": ach_item.get("description", ""),
+            "icon_url": ach_item.get("icon_url", ""),
+            "unlocked_count": int(unlocked_count),
+            "total_count": int(total_count),
+            "ts": int(time.time())
+        })
+        if len(ACHIEVEMENT_POPUP_QUEUE) > 25:
+            del ACHIEVEMENT_POPUP_QUEUE[:-25]
+
+def _parse_vdf_bin_typed(data, pos=0):
+    res = {}
+    n = len(data)
+    while pos < n:
+        t = data[pos]
+        pos += 1
+        if t == 8:
+            break
+        end = data.find(b"\x00", pos)
+        if end == -1:
+            break
+        key = data[pos:end].decode("utf-8", errors="replace")
+        pos = end + 1
+        if t == 0:
+            val, pos = _parse_vdf_bin_typed(data, pos)
+            res[key] = val
+        elif t == 1:
+            end2 = data.find(b"\x00", pos)
+            if end2 == -1:
+                break
+            res[key] = ("str", data[pos:end2].decode("utf-8", errors="replace"))
+            pos = end2 + 1
+        elif t == 2:
+            if pos + 4 > n:
+                break
+            res[key] = ("int", struct.unpack("<I", data[pos:pos+4])[0])
+            pos += 4
+        elif t == 3:
+            if pos + 4 > n:
+                break
+            res[key] = ("float", struct.unpack("<f", data[pos:pos+4])[0])
+            pos += 4
+        elif t == 7:
+            if pos + 8 > n:
+                break
+            res[key] = ("uint64", struct.unpack("<Q", data[pos:pos+8])[0])
+            pos += 8
+        else:
+            break
+    return res, pos
+
+def _dump_vdf_bin_typed(d):
+    out = bytearray()
+    for k, v in d.items():
+        kb = str(k).encode("utf-8") + b"\x00"
+        if isinstance(v, dict):
+            out.append(0)
+            out.extend(kb)
+            out.extend(_dump_vdf_bin_typed(v))
+        elif isinstance(v, tuple) and len(v) == 2:
+            t_name, val = v
+            if t_name == "str":
+                out.append(1)
+                out.extend(kb)
+                out.extend(str(val).encode("utf-8") + b"\x00")
+            elif t_name == "int":
+                out.append(2)
+                out.extend(kb)
+                out.extend(struct.pack("<I", int(val) & 0xFFFFFFFF))
+            elif t_name == "float":
+                out.append(3)
+                out.extend(kb)
+                out.extend(struct.pack("<f", float(val)))
+            elif t_name == "uint64":
+                out.append(7)
+                out.extend(kb)
+                out.extend(struct.pack("<Q", int(val) & 0xFFFFFFFFFFFFFFFF))
+    out.append(8)
+    return bytes(out)
+
+def _unwrap_vdf_typed(obj):
+    if isinstance(obj, tuple) and len(obj) == 2:
+        return obj[1]
+    if isinstance(obj, dict):
+        return {k: _unwrap_vdf_typed(v) for k, v in obj.items()}
+    return obj
+
+def parse_game_achievement_schema(steam_path, appid):
+    aid_s = str(appid)
+    if aid_s in SCHEMA_CACHE:
+        return SCHEMA_CACHE[aid_s]
+
+    schema_path = os.path.join(steam_path, "appcache", "stats", f"UserGameStatsSchema_{aid_s}.bin")
+    if not os.path.exists(schema_path):
+        return []
+
+    achievements = []
+    try:
+        raw = open(schema_path, "rb").read()
+        parsed_typed, _ = _parse_vdf_bin_typed(raw)
+        parsed = _unwrap_vdf_typed(parsed_typed)
+        app_block = parsed.get(aid_s) or next(iter(parsed.values()), {})
+        stats_block = app_block.get("stats", {}) if isinstance(app_block, dict) else {}
+
+        for stat_id, stat_def in stats_block.items():
+            if not isinstance(stat_def, dict):
+                continue
+            stype = str(stat_def.get("type", "")).upper()
+            bits_block = stat_def.get("bits", {})
+            if stype not in ("ACHIEVEMENTS", "4") and not bits_block:
+                continue
+            if not isinstance(bits_block, dict):
+                continue
+            for bit_key, bit_def in bits_block.items():
+                if not isinstance(bit_def, dict) or not str(bit_key).isdigit():
+                    continue
+                bit_num = int(bit_key)
+                disp = bit_def.get("display", {}) if isinstance(bit_def.get("display"), dict) else {}
+                name_obj = disp.get("name", {})
+                desc_obj = disp.get("desc") or disp.get("description") or {}
+                title = (
+                    name_obj.get("english") or next(iter(name_obj.values()), "")
+                    if isinstance(name_obj, dict) else str(name_obj or "")
+                )
+                desc = (
+                    desc_obj.get("english") or next(iter(desc_obj.values()), "")
+                    if isinstance(desc_obj, dict) else str(desc_obj or "")
+                )
+                icon_fn = str(disp.get("icon", "") or "")
+                icon_gray_fn = str(disp.get("icon_gray", "") or icon_fn)
+                hidden_flag = str(disp.get("hidden", "0")) == "1"
+                achievements.append({
+                    "key": f"{stat_id}:{bit_num}",
+                    "stat_id": str(stat_id),
+                    "bit_id": bit_num,
+                    "api_name": str(bit_def.get("name", f"ACH_{stat_id}_{bit_num}")),
+                    "title": title or str(bit_def.get("name", f"Achievement #{len(achievements)+1}")),
+                    "description": desc,
+                    "hidden": hidden_flag,
+                    "icon_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_fn}" if icon_fn else "",
+                    "icon_gray_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_gray_fn}" if icon_gray_fn else ""
+                })
+        achievements.sort(key=lambda x: (int(x["stat_id"]) if x["stat_id"].isdigit() else 0, x["bit_id"]))
+        SCHEMA_CACHE[aid_s] = achievements
+    except Exception:
+        return []
+    return achievements
+
+def read_steam_user_achievements(steam_path, sid3, appid):
+    """Read unlocked achievement keys and timestamps from Steam's UserGameStats_<sid3>_<appid>.bin."""
+    aid_s = str(appid)
+    schema = parse_game_achievement_schema(steam_path, aid_s)
+    ach_stat_ids = {item["stat_id"] for item in schema}
+    stats_dir = os.path.join(steam_path, "appcache", "stats")
+    candidates = []
+    if sid3:
+        p_main = os.path.join(stats_dir, f"UserGameStats_{sid3}_{aid_s}.bin")
+        if os.path.exists(p_main):
+            candidates.append(p_main)
+    if not candidates:
+        candidates = glob.glob(os.path.join(stats_dir, f"UserGameStats_*_{aid_s}.bin"))
+
+    unlocked = {}
+    for cp in candidates:
+        try:
+            raw = open(cp, "rb").read()
+            parsed_typed, _ = _parse_vdf_bin_typed(raw)
+            parsed = _unwrap_vdf_typed(parsed_typed)
+            cache = parsed.get("cache", {})
+            if not isinstance(cache, dict):
+                continue
+            for stat_id, s_val in cache.items():
+                if ach_stat_ids and str(stat_id) not in ach_stat_ids:
+                    continue
+                if not isinstance(s_val, dict):
+                    continue
+                mask = int(s_val.get("data", 0) or 0)
+                times = s_val.get("AchievementTimes", {})
+                if not isinstance(times, dict):
+                    times = {}
+                for b in range(32):
+                    if mask & (1 << b):
+                        k = f"{stat_id}:{b}"
+                        ts = int(times.get(str(b), 0) or int(os.path.getmtime(cp)))
+                        unlocked[k] = ts
+        except Exception:
+            pass
+    return unlocked
+
+def apply_personal_achievements_to_steam_bin(steam_path, sid3, appid, personal_map=None):
+    """Write personal achievement bitmasks into UserGameStats_*_<appid>.bin so Steam/game only sees user's own achievements."""
+    aid_s = str(appid)
+    if personal_map is None:
+        personal_map = get_game_personal_achievements(aid_s)
+
+    schema = parse_game_achievement_schema(steam_path, aid_s)
+    ach_stat_ids = {item["stat_id"] for item in schema}
+    if not ach_stat_ids:
+        return False
+
+    stats_dir = os.path.join(steam_path, "appcache", "stats")
+    os.makedirs(stats_dir, exist_ok=True)
+    target_bins = set(glob.glob(os.path.join(stats_dir, f"UserGameStats_*_{aid_s}.bin")))
+    if sid3:
+        target_bins.add(os.path.join(stats_dir, f"UserGameStats_{sid3}_{aid_s}.bin"))
+    if not target_bins:
+        return False
+
+    wrote_any = False
+    for target_bin in target_bins:
+        parsed_typed = {"cache": {"crc": ("int", 0), "PendingChanges": ("int", 0)}}
+        if os.path.exists(target_bin):
+            try:
+                raw = open(target_bin, "rb").read()
+                pt, _ = _parse_vdf_bin_typed(raw)
+                if isinstance(pt, dict) and "cache" in pt:
+                    parsed_typed = pt
+            except Exception:
+                pass
+
+        cache_block = parsed_typed.setdefault("cache", {})
+        for stat_id in ach_stat_ids:
+            mask = 0
+            times_typed = {}
+            for k, ts in personal_map.items():
+                parts = str(k).split(":", 1)
+                if len(parts) == 2 and parts[0] == str(stat_id) and parts[1].isdigit():
+                    b = int(parts[1])
+                    if 0 <= b < 32:
+                        mask |= (1 << b)
+                        times_typed[str(b)] = ("int", int(ts or time.time()))
+            stat_entry = cache_block.get(str(stat_id))
+            if not isinstance(stat_entry, dict):
+                stat_entry = {}
+            stat_entry["data"] = ("int", mask)
+            if times_typed:
+                stat_entry["AchievementTimes"] = times_typed
+            else:
+                stat_entry.pop("AchievementTimes", None)
+            cache_block[str(stat_id)] = stat_entry
+
+        try:
+            out_bytes = _dump_vdf_bin_typed(parsed_typed)
+            with open(target_bin, "wb") as f:
+                f.write(out_bytes)
+            wrote_any = True
+        except Exception:
+            pass
+    return wrote_any
+
+def sync_cloud_achievements_bundle(steam_path=None, direction="both"):
+    """Automatically sync all games' personal achievements for the logged-in Cloud user via CLOUD_ACH_APPID."""
+    cfg = load_cloud_config()
+    username = (cfg.get("username") or "").strip().lower()
+    if not cfg.get("server_url") or not username or not cfg.get("password"):
+        return False, "Cloud belum login"
+
+    raw = load_personal_achievements_raw()
+    local_prof = raw["profiles"].setdefault(username, {})
+    local_rst = raw["reset_at"].setdefault(username, {})
+    changed_local = False
+
+    # 1. Pull & merge from Cloud bundle if direction in ('both', 'pull')
+    if direction in ("both", "pull"):
+        dl_bytes, dl_err = cloud_request(f"/api/saves/{CLOUD_ACH_APPID}/download", timeout=8)
+        if not dl_err and isinstance(dl_bytes, bytes):
+            try:
+                with zipfile.ZipFile(io.BytesIO(dl_bytes), "r") as zf:
+                    if "achievements_bundle.json" in zf.namelist():
+                        bundle = json.loads(zf.read("achievements_bundle.json").decode("utf-8", errors="ignore"))
+                        c_prof = bundle.get("unlocked", {}) if isinstance(bundle, dict) else {}
+                        c_rst = bundle.get("reset_at", {}) if isinstance(bundle, dict) else {}
+                        if isinstance(c_rst, dict):
+                            for aid, r_ts in c_rst.items():
+                                r_ts_i = int(r_ts or 0)
+                                cur_r = int(local_rst.get(str(aid), 0) or 0)
+                                if r_ts_i > cur_r:
+                                    local_rst[str(aid)] = r_ts_i
+                                    # Drop local achievements unlocked before this reset
+                                    cur_map = local_prof.get(str(aid), {})
+                                    if isinstance(cur_map, dict):
+                                        local_prof[str(aid)] = {k: v for k, v in cur_map.items() if int(v or 0) > r_ts_i}
+                                    changed_local = True
+                        if isinstance(c_prof, dict):
+                            for aid, ach_map in c_prof.items():
+                                if not isinstance(ach_map, dict):
+                                    continue
+                                rst_ts = int(local_rst.get(str(aid), 0) or 0)
+                                dest = local_prof.setdefault(str(aid), {})
+                                for k, ts in ach_map.items():
+                                    ts_i = int(ts or 0)
+                                    if ts_i > rst_ts and (str(k) not in dest or ts_i < int(dest[str(k)] or 0)):
+                                        dest[str(k)] = ts_i
+                                        changed_local = True
+            except Exception:
+                pass
+
+    if changed_local:
+        save_personal_achievements_raw(raw)
+        if steam_path:
+            running_aid = get_running_steam_appid()
+            for aid, ach_map in local_prof.items():
+                if str(aid) != str(running_aid):
+                    apply_personal_achievements_to_steam_bin(steam_path, "", aid, ach_map)
+
+    # 2. Push merged bundle to Cloud if direction in ('both', 'push')
+    if direction in ("both", "push"):
+        try:
+            payload_bytes = json.dumps({
+                "user": username,
+                "updated_at": int(time.time()),
+                "unlocked": local_prof,
+                "reset_at": local_rst
+            }, indent=2, ensure_ascii=False).encode("utf-8")
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("achievements_bundle.json", payload_bytes)
+            zip_bytes = buf.getvalue()
+            sha = hashlib.sha256(payload_bytes).hexdigest()
+            up_headers = {
+                "Content-Type": "application/zip",
+                "X-Save-Mtime": str(int(time.time())),
+                "X-Save-Content-Sha": sha,
+                "X-Device-Name": cfg.get("device_name", "PC"),
+                "X-Game-Name": "Personal Achievements Bundle",
+                "X-Account-Name": username
+            }
+            cloud_request(f"/api/saves/{CLOUD_ACH_APPID}/upload", method="POST", body=zip_bytes, headers=up_headers, timeout=10)
+        except Exception:
+            pass
+
+    return True, "OK"
+
+def capture_new_achievements_from_steam_bin(steam_path, sid3, appid, session_start_ts=0, game_name="", trigger_popup=True):
+    """Detect newly unlocked achievements in UserGameStats_<sid3>_<appid>.bin, trigger popup, and auto-sync to Cloud."""
+    aid_s = str(appid)
+    steam_unlocked = read_steam_user_achievements(steam_path, sid3, aid_s)
+    if not steam_unlocked:
+        return []
+    personal_map = get_game_personal_achievements(aid_s)
+    rst_ts = get_game_reset_timestamp(aid_s)
+    newly_unlocked_keys = []
+    now_ts = int(time.time())
+    for k, ts in steam_unlocked.items():
+        if k not in personal_map:
+            # Ignore stale achievements from before an explicit reset unless unlocked during this live session
+            if rst_ts and ts < rst_ts and (not session_start_ts or ts < session_start_ts - 60):
+                continue
+            personal_map[k] = ts if (session_start_ts and ts >= session_start_ts - 120) else now_ts
+            newly_unlocked_keys.append(k)
+    if newly_unlocked_keys:
+        set_game_personal_achievements(aid_s, personal_map)
+        schema = parse_game_achievement_schema(steam_path, aid_s)
+        schema_by_key = {item["key"]: item for item in schema}
+        titles = []
+        for k in newly_unlocked_keys:
+            item = schema_by_key.get(k, {"key": k, "title": k, "description": "", "icon_url": ""})
+            titles.append(item.get("title", k))
+            if trigger_popup:
+                enqueue_achievement_popup(aid_s, game_name or f"App {aid_s}", item, len(personal_map), len(schema))
+        LAST_ACHIEVEMENT_UNLOCK[aid_s] = {
+            "ts": now_ts,
+            "count": len(newly_unlocked_keys),
+            "titles": titles
+        }
+        # Auto-sync personal achievements to Cloud immediately in background
+        threading.Thread(target=sync_cloud_achievements_bundle, args=(steam_path, "both"), daemon=True).start()
+    return newly_unlocked_keys
+
+def get_game_achievements_view(steam_path, appid, account_info):
+    aid_s = str(appid)
+    sid3 = account_info.get("steamid3", "")
+    schema = parse_game_achievement_schema(steam_path, aid_s)
+    personal_map = get_game_personal_achievements(aid_s)
+    steam_local_map = read_steam_user_achievements(steam_path, sid3, aid_s)
+
+    items = []
+    for ach in schema:
+        k = ach["key"]
+        unlocked_ts = personal_map.get(k, 0)
+        is_un = bool(unlocked_ts > 0)
+        items.append({
+            **ach,
+            "unlocked": is_un,
+            "unlocked_at": int(unlocked_ts) if is_un else 0,
+            "in_steam_local": k in steam_local_map
+        })
+    return {
+        "achievements": items,
+        "unlocked_count": sum(1 for x in items if x["unlocked"]),
+        "total_count": len(items),
+        "steam_local_count": len(steam_local_map)
+    }
 
 def get_startup_command():
     exe_candidate = os.path.join(BASE_DIR, "SteamSwitcher.exe")
@@ -592,6 +1065,8 @@ def pack_save_zip_bytes(steam_path, appid, account_info):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         manifest = {"appid": str(appid), "files_sha256": content_sha, "updated_at": latest_mtime}
         zf.writestr("_cloud_manifest.json", json.dumps(manifest))
+        pers_ach = get_game_personal_achievements(appid)
+        zf.writestr("_personal_achievements.json", json.dumps(pers_ach))
         for idx, rel_p, abs_p, mtime in files:
             arcname = f"t{idx}/{rel_p}"
             zf.write(abs_p, arcname)
@@ -604,8 +1079,16 @@ def unpack_save_zip_bytes(steam_path, appid, account_info, zip_bytes, mtime_to_a
 
     buf = io.BytesIO(zip_bytes)
     with zipfile.ZipFile(buf, "r") as zf:
+        if "_personal_achievements.json" in zf.namelist():
+            try:
+                ach_data = json.loads(zf.read("_personal_achievements.json").decode("utf-8", errors="ignore"))
+                if isinstance(ach_data, dict):
+                    set_game_personal_achievements(appid, ach_data)
+                    apply_personal_achievements_to_steam_bin(steam_path, account_info.get("steamid3", ""), appid, ach_data)
+            except Exception:
+                pass
         for member in zf.namelist():
-            if member == "_cloud_manifest.json" or member.endswith("/"):
+            if member in ("_cloud_manifest.json", "_personal_achievements.json") or member.endswith("/"):
                 continue
             parts = member.split("/", 1)
             if len(parts) == 2 and parts[0].startswith("t") and parts[0][1:].isdigit():
@@ -890,11 +1373,13 @@ def restore_save_from_history(steam_path, appid, account_info, game_name, source
     return True, f"Versi save '{game_name}' berhasil diterapkan ke folder Steam!"
 
 def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
-    """Background watcher: waits for game to run in Steam, and auto-uploads save as soon as game exits if Cloud Save is checked."""
+    """Background watcher: waits for game to run in Steam, tracks personal achievements in real-time, and auto-uploads save on exit."""
     watch_key = str(appid)
     if watch_key in ACTIVE_WATCHERS:
         return
     ACTIVE_WATCHERS.add(watch_key)
+    sid3 = account_info.get("steamid3", "")
+    session_start_ts = int(time.time())
     try:
         _, initial_mtime, initial_sha = collect_local_save_files(steam_path, appid, account_info)
         # 1. Wait up to 90 seconds for Steam to mark the game as Running
@@ -905,17 +1390,26 @@ def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
                 break
             time.sleep(2)
         if started:
-            # 2. Wait while game is running
+            # 2. Poll personal achievements every 1.2s in real-time while game is running
             while is_app_running_in_steam(appid):
-                time.sleep(1.5)
-            # 3. Game just closed! Check if Cloud Save is enabled for this game
+                new_rt = capture_new_achievements_from_steam_bin(
+                    steam_path, sid3, appid, session_start_ts=session_start_ts, game_name=game_name, trigger_popup=True
+                )
+                if new_rt:
+                    build_full_state()
+                time.sleep(1.2)
+            # 3. Game just closed! Final achievement capture + Cloud Save upload if enabled
+            time.sleep(1.2)
+            new_ach = capture_new_achievements_from_steam_bin(
+                steam_path, sid3, appid, session_start_ts=session_start_ts, game_name=game_name, trigger_popup=True
+            )
             if is_game_cloud_enabled(appid):
                 UPLOADING_APPIDS.add(watch_key)
                 UPLOADING_UNTIL[watch_key] = time.time() + 4.5
                 try:
-                    time.sleep(2.0)
+                    time.sleep(1.0)
                     _, new_mtime, new_sha = collect_local_save_files(steam_path, appid, account_info)
-                    if new_sha and new_sha != initial_sha:
+                    if (new_sha and new_sha != initial_sha) or new_ach:
                         ok_u, act_u, msg_u = sync_game_save(steam_path, appid, account_info, game_name, direction="upload")
                     else:
                         ok_u, act_u, msg_u = sync_game_save(steam_path, appid, account_info, game_name, direction="auto")
@@ -925,10 +1419,13 @@ def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
                     UPLOADING_APPIDS.discard(watch_key)
             build_full_state()
         else:
-            # Fallback: check if save files changed after 30s
+            # Fallback: check if save files or achievements changed
+            new_ach = capture_new_achievements_from_steam_bin(
+                steam_path, sid3, appid, session_start_ts=session_start_ts, game_name=game_name, trigger_popup=True
+            )
             if is_game_cloud_enabled(appid):
                 _, new_mtime, new_sha = collect_local_save_files(steam_path, appid, account_info)
-                if new_sha and new_sha != initial_sha:
+                if (new_sha and new_sha != initial_sha) or new_ach:
                     UPLOADING_APPIDS.add(watch_key)
                     UPLOADING_UNTIL[watch_key] = time.time() + 4.0
                     try:
@@ -943,6 +1440,49 @@ def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
     finally:
         UPLOADING_APPIDS.discard(watch_key)
         ACTIVE_WATCHERS.discard(watch_key)
+
+def global_game_watcher_loop():
+    """Continuous background daemon: auto-syncs Cloud achievements on startup and attaches real-time watcher to any running Steam game."""
+    time.sleep(1.5)
+    try:
+        reg = get_steam_registry_info()
+        sp = reg["steam_path"]
+        # 1. Sync personal achievements with Cloud on startup
+        sync_cloud_achievements_bundle(sp, direction="both")
+        # 2. Sanitize local Steam achievement bins for all non-running installed games so shared-account achievements don't leak
+        running_now = get_running_steam_appid()
+        installed = get_installed_games(sp)
+        for aid in installed:
+            if str(aid) != str(running_now):
+                apply_personal_achievements_to_steam_bin(sp, "", aid)
+        build_full_state()
+    except Exception:
+        pass
+
+    while True:
+        try:
+            running_aid = get_running_steam_appid()
+            if running_aid and running_aid != "0" and running_aid not in NON_GAME_APPIDS and running_aid not in ACTIVE_WATCHERS:
+                reg = get_steam_registry_info()
+                sp = reg["steam_path"]
+                accounts = parse_loginusers(sp)
+                cur_acc = reg.get("auto_login_user", "")
+                acc_info = accounts.get(cur_acc, {})
+                if not acc_info and reg.get("active_user_sid3"):
+                    for a_obj in accounts.values():
+                        if str(a_obj.get("steamid3")) == str(reg.get("active_user_sid3")):
+                            acc_info = a_obj
+                            break
+                installed = get_installed_games(sp)
+                gname = (installed.get(running_aid) or {}).get("name") or resolve_game_name(sp, running_aid)
+                threading.Thread(
+                    target=watch_game_and_auto_upload,
+                    args=(sp, running_aid, acc_info, gname),
+                    daemon=True
+                ).start()
+        except Exception:
+            pass
+        time.sleep(1.5)
 
 def parse_loginusers(steam_path):
     """Parse loginusers.vdf strictly for currently registered Steam accounts."""
@@ -1154,6 +1694,10 @@ def build_full_state():
 
         acc_info = accounts.get(owner_account, {})
         save_files, save_mtime, _ = collect_local_save_files(steam_path, aid, acc_info)
+        ach_schema = parse_game_achievement_schema(steam_path, aid)
+        pers_ach = get_game_personal_achievements(aid)
+        valid_ach_keys = {x["key"] for x in ach_schema}
+        ach_unlocked_cnt = sum(1 for k, v in pers_ach.items() if v and (not valid_ach_keys or k in valid_ach_keys))
 
         games_list.append({
             "appid": aid,
@@ -1171,7 +1715,9 @@ def build_full_state():
             "has_local_cover": has_local_cover,
             "cover_src": COVER_B64_CACHE.get(aid, f"/api/cover/{aid}"),
             "has_local_save": len(save_files) > 0,
-            "local_save_mtime": save_mtime
+            "local_save_mtime": save_mtime,
+            "ach_unlocked": ach_unlocked_cnt,
+            "ach_total": len(ach_schema)
         })
 
     games_list.sort(key=lambda g: (g["name"].lower(), g["appid"]))
@@ -1338,7 +1884,11 @@ def switch_and_launch(target_account, appid=None, install_mode=False, game_name=
         if not ok:
             return False, msg
 
-    # 3. Launch Game or Steam
+    # 3. Isolate local Steam achievement bin to match user's personal achievements before launching game
+    if appid and not install_mode:
+        apply_personal_achievements_to_steam_bin(steam_path, acc_info.get("steamid3", ""), appid)
+
+    # 4. Launch Game or Steam
     if appid:
         if install_mode:
             cmd = [steam_exe, f"steam://install/{appid}"]
@@ -1442,6 +1992,23 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
+        if path == "/overlay.html":
+            raw = OVERLAY_HTML_PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        if path == "/api/achievement_popups":
+            with POPUP_LOCK:
+                items = list(ACHIEVEMENT_POPUP_QUEUE)
+                ACHIEVEMENT_POPUP_QUEUE.clear()
+            self.send_json({"ok": True, "popups": items})
+            return
+
         if path == "/api/state":
             LAST_UI_ACTIVITY_TS = time.time()
             state = build_full_state()
@@ -1455,6 +2022,7 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 "running_appids": get_running_appids(),
                 "uploading_appids": get_uploading_appids(),
                 "last_uploads": LAST_UPLOAD_MSG,
+                "last_achievements": LAST_ACHIEVEMENT_UNLOCK,
                 "active_account": get_steam_registry_info().get("auto_login_user", "")
             })
             return
@@ -1539,6 +2107,106 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             acc_info = accounts.get(account, {})
             ok, msg = restore_save_from_history(reg["steam_path"], appid, acc_info, game_name, source, filename, mtime_hint=mtime_hint)
             self.send_json({"ok": ok, "message": msg})
+            return
+
+        if self.path == "/api/achievements":
+            appid = str(payload.get("appid", "")).strip()
+            account = payload.get("account", "").strip()
+            reg = get_steam_registry_info()
+            accounts = parse_loginusers(reg["steam_path"])
+            acc_info = accounts.get(account, {})
+            view = get_game_achievements_view(reg["steam_path"], appid, acc_info)
+            self.send_json({"ok": True, **view})
+            return
+
+        if self.path == "/api/toggle_achievement":
+            appid = str(payload.get("appid", "")).strip()
+            account = payload.get("account", "").strip()
+            game_name = payload.get("game_name", "").strip() or f"App {appid}"
+            action = payload.get("action", "toggle").strip()
+            ach_key = str(payload.get("ach_key", "")).strip()
+            unlocked = bool(payload.get("unlocked", True))
+
+            reg = get_steam_registry_info()
+            steam_path = reg["steam_path"]
+            accounts = parse_loginusers(steam_path)
+            acc_info = accounts.get(account, {})
+            sid3 = acc_info.get("steamid3", "")
+
+            pers_map = get_game_personal_achievements(appid)
+            schema = parse_game_achievement_schema(steam_path, appid)
+            schema_by_key = {item["key"]: item for item in schema}
+
+            if action == "test_popup":
+                sample_item = schema[0] if schema else {
+                    "key": "test:0",
+                    "title": "Contoh Achievement Terbuka",
+                    "description": "Notifikasi otomatis saat misi achievement selesai di dalam game.",
+                    "icon_url": ""
+                }
+                for it in schema:
+                    if it["key"] in pers_map:
+                        sample_item = it
+                        break
+                enqueue_achievement_popup(appid, game_name, sample_item, len(pers_map) or 1, len(schema) or 1)
+                view = get_game_achievements_view(steam_path, appid, acc_info)
+                self.send_json({"ok": True, "message": "Popup notifikasi achievement ditampilkan di pojok kanan bawah layar!", **view})
+                return
+
+            if action == "reset_all":
+                pers_map = {}
+                set_game_personal_achievements(appid, pers_map, mark_reset=True)
+                msg_out = f"Seluruh achievement '{game_name}' berhasil di-reset ke 0."
+            elif action == "sync_cloud":
+                cfg = load_cloud_config()
+                if not cfg.get("server_url") or not cfg.get("username"):
+                    self.send_json({"ok": False, "message": "Silakan Login Cloud terlebih dahulu di kanan atas launcher."}, 400)
+                    return
+                sync_cloud_achievements_bundle(steam_path, direction="both")
+                pers_map = get_game_personal_achievements(appid)
+                rst_ts = get_game_reset_timestamp(appid)
+                dl_bytes, dl_err = cloud_request(f"/api/saves/{appid}/download", timeout=12)
+                cloud_ach = {}
+                if not dl_err and isinstance(dl_bytes, bytes):
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(dl_bytes), "r") as zf:
+                            if "_personal_achievements.json" in zf.namelist():
+                                loaded_c = json.loads(zf.read("_personal_achievements.json").decode("utf-8", errors="ignore"))
+                                if isinstance(loaded_c, dict):
+                                    cloud_ach = loaded_c
+                    except Exception:
+                        pass
+                for k, ts in cloud_ach.items():
+                    try:
+                        ts_i = int(ts)
+                        if ts_i > rst_ts and (k not in pers_map or ts_i < pers_map[k]):
+                            pers_map[str(k)] = ts_i
+                    except Exception:
+                        pass
+                set_game_personal_achievements(appid, pers_map)
+                msg_out = f"Sinkronisasi Cloud selesai! ({len(pers_map)} achievement tersinkron untuk '{game_name}')"
+            else:
+                if unlocked:
+                    pers_map[ach_key] = int(time.time())
+                    msg_out = "Achievement ditandai terbuka!"
+                    ach_item = schema_by_key.get(ach_key, {"key": ach_key, "title": ach_key, "description": "", "icon_url": ""})
+                    enqueue_achievement_popup(appid, game_name, ach_item, len(pers_map), len(schema))
+                else:
+                    pers_map.pop(ach_key, None)
+                    msg_out = "Achievement dikunci kembali."
+                set_game_personal_achievements(appid, pers_map)
+
+            apply_personal_achievements_to_steam_bin(steam_path, sid3, appid, pers_map)
+            threading.Thread(target=sync_cloud_achievements_bundle, args=(steam_path, "both"), daemon=True).start()
+            if is_game_cloud_enabled(appid) or action == "sync_cloud":
+                threading.Thread(
+                    target=sync_game_save,
+                    args=(steam_path, appid, acc_info, game_name, "upload"),
+                    daemon=True
+                ).start()
+            build_full_state()
+            view = get_game_achievements_view(steam_path, appid, acc_info)
+            self.send_json({"ok": True, "message": msg_out, **view})
             return
 
         if self.path == "/api/switch_account":
@@ -1626,6 +2294,14 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 "password": password,
                 "device_name": device_name
             })
+            def _post_login_ach_sync():
+                try:
+                    reg_i = get_steam_registry_info()
+                    sync_cloud_achievements_bundle(reg_i["steam_path"], direction="both")
+                    build_full_state()
+                except Exception:
+                    pass
+            threading.Thread(target=_post_login_ach_sync, daemon=True).start()
             build_full_state()
             self.send_json({"ok": True, "message": resp.get("message", "Berhasil!")})
             return
@@ -1716,7 +2392,195 @@ ELECTRON_RUNTIME_DIR = os.path.join(
 )
 ELECTRON_PROC = None
 
-ELECTRON_MAIN_JS = """const { app, BrowserWindow } = require('electron');
+OVERLAY_HTML_PAGE = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<title>HIDE_OVERLAY</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+  .toast-wrap {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    width: 364px;
+    padding: 13px 15px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, rgba(15, 23, 42, 0.97) 0%, rgba(23, 37, 84, 0.97) 100%);
+    border: 1px solid rgba(250, 204, 21, 0.55);
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.75), 0 0 18px rgba(250, 204, 21, 0.18);
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    transform: translateY(140%);
+    opacity: 0;
+    transition: transform 0.38s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.32s ease;
+  }
+  .toast-wrap.visible {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  .ach-icon {
+    width: 54px;
+    height: 54px;
+    border-radius: 9px;
+    object-fit: cover;
+    flex-shrink: 0;
+    border: 1.5px solid #facc15;
+    background: #1e293b;
+    box-shadow: 0 0 12px rgba(250, 204, 21, 0.35);
+  }
+  .ach-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .ach-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .ach-tag {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    color: #facc15;
+  }
+  .ach-prog {
+    font-size: 10px;
+    font-weight: 700;
+    color: #4ade80;
+    background: rgba(34, 197, 94, 0.16);
+    border: 1px solid rgba(34, 197, 94, 0.35);
+    padding: 1px 6px;
+    border-radius: 999px;
+  }
+  .ach-title {
+    font-size: 13.5px;
+    font-weight: 700;
+    color: #f8fafc;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ach-desc {
+    font-size: 11.5px;
+    color: #cbd5e1;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.3;
+  }
+</style>
+</head>
+<body>
+  <div class="toast-wrap" id="toastBox">
+    <img class="ach-icon" id="toastIcon" src="" alt="" />
+    <div class="ach-body">
+      <div class="ach-header">
+        <span class="ach-tag">🏆 ACHIEVEMENT TERBUKA</span>
+        <span class="ach-prog" id="toastProg">1/1</span>
+      </div>
+      <div class="ach-title" id="toastTitle">Achievement</div>
+      <div class="ach-desc" id="toastDesc"></div>
+    </div>
+  </div>
+<script>
+  const FALLBACK_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#1e293b"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="28">🏆</text></svg>'
+  );
+  const iconEl = document.getElementById('toastIcon');
+  iconEl.onerror = function() {
+    const cur = iconEl.getAttribute('src') || '';
+    if (!iconEl.dataset.cf && cur.includes('cdn.akamai.steamstatic.com')) {
+      iconEl.dataset.cf = '1';
+      iconEl.src = cur.replace('cdn.akamai.steamstatic.com', 'cdn.cloudflare.steamstatic.com');
+      return;
+    }
+    iconEl.src = FALLBACK_SVG;
+  };
+
+  function playUnlockSound() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      const now = ctx.currentTime;
+      const notes = [523.25, 659.25, 783.99, 1046.50];
+      notes.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.085);
+        gain.gain.setValueAtTime(0.001, now + idx * 0.085);
+        gain.gain.exponentialRampToValueAtTime(0.18, now + idx * 0.085 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.085 + 0.55);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + idx * 0.085);
+        osc.stop(now + idx * 0.085 + 0.6);
+      });
+    } catch (e) {}
+  }
+
+  let queue = [];
+  let showing = false;
+
+  async function processQueue() {
+    if (showing || queue.length === 0) return;
+    showing = true;
+    const item = queue.shift();
+    document.title = 'SHOW_OVERLAY';
+    iconEl.dataset.cf = '';
+    iconEl.src = item.icon_url || FALLBACK_SVG;
+    document.getElementById('toastTitle').textContent = item.title || 'Achievement Unlocked';
+    document.getElementById('toastDesc').textContent = item.description || item.game_name || '';
+    document.getElementById('toastProg').textContent = `${item.unlocked_count || 1}/${item.total_count || 1}`;
+
+    await new Promise(r => setTimeout(r, 60));
+    playUnlockSound();
+    document.getElementById('toastBox').classList.add('visible');
+
+    await new Promise(r => setTimeout(r, 4800));
+    document.getElementById('toastBox').classList.remove('visible');
+    await new Promise(r => setTimeout(r, 420));
+
+    if (queue.length === 0) {
+      document.title = 'HIDE_OVERLAY';
+    }
+    showing = false;
+    if (queue.length > 0) processQueue();
+  }
+
+  async function pollPopups() {
+    try {
+      const res = await fetch('/api/achievement_popups');
+      const data = await res.json();
+      if (data && Array.isArray(data.popups) && data.popups.length > 0) {
+        queue.push(...data.popups);
+        processQueue();
+      }
+    } catch (e) {}
+  }
+  setInterval(pollPopups, 1100);
+</script>
+</body>
+</html>
+"""
+
+ELECTRON_MAIN_JS = """const { app, BrowserWindow, screen } = require('electron');
 const path = require('path');
 const os = require('os');
 
@@ -1725,12 +2589,16 @@ app.commandLine.appendSwitch('disable-extensions');
 app.commandLine.appendSwitch('disable-sync');
 app.commandLine.appendSwitch('disable-features', 'Translate');
 app.commandLine.appendSwitch('no-proxy-server');
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
   app.quit();
 } else {
   let win = null;
+  let overlayWin = null;
+  let baseUrl = 'http://127.0.0.1:18420';
+
   app.on('second-instance', () => {
     if (win) {
       if (win.isMinimized()) win.restore();
@@ -1741,14 +2609,15 @@ if (!gotTheLock) {
 
   app.whenReady().then(() => {
     const args = process.argv;
-    let url = 'http://127.0.0.1:18420';
     let w = 1280, h = 820, x = undefined, y = undefined;
+    let hideMain = false;
     for (const a of args) {
-      if (a.startsWith('--app-url=')) url = a.split('=')[1];
+      if (a.startsWith('--app-url=')) baseUrl = a.split('=')[1];
       if (a.startsWith('--win-w=')) w = parseInt(a.split('=')[1], 10) || 1280;
       if (a.startsWith('--win-h=')) h = parseInt(a.split('=')[1], 10) || 820;
       if (a.startsWith('--win-x=')) x = parseInt(a.split('=')[1], 10);
       if (a.startsWith('--win-y=')) y = parseInt(a.split('=')[1], 10);
+      if (a === '--hidden') hideMain = true;
     }
 
     const opts = {
@@ -1758,6 +2627,7 @@ if (!gotTheLock) {
       minHeight: 480,
       backgroundColor: '#0b0f19',
       autoHideMenuBar: true,
+      show: !hideMain,
       icon: path.join(__dirname, 'logo.ico'),
       title: 'Steam Switcher',
       webPreferences: {
@@ -1772,7 +2642,62 @@ if (!gotTheLock) {
 
     win = new BrowserWindow(opts);
     win.setMenuBarVisibility(false);
-    win.loadURL(url);
+    win.loadURL(baseUrl);
+
+    win.on('close', (e) => {
+      if (!app.isQuiting) {
+        e.preventDefault();
+        const b = win.getBounds();
+        fetch(baseUrl + '/api/window_closed', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ width: b.width, height: b.height, x: b.x, y: b.y })
+        }).catch(() => {});
+        win.hide();
+      }
+    });
+
+    // Topmost non-focusable overlay window for Steam-style Achievement Unlocks
+    const disp = screen.getPrimaryDisplay();
+    const wa = disp.workArea;
+    const ow = 392, oh = 116;
+    overlayWin = new BrowserWindow({
+      width: ow,
+      height: oh,
+      x: wa.x + wa.width - ow - 8,
+      y: wa.y + wa.height - oh - 8,
+      frame: false,
+      transparent: true,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      closable: false,
+      focusable: false,
+      skipTaskbar: true,
+      alwaysOnTop: true,
+      show: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        backgroundThrottling: false
+      }
+    });
+    overlayWin.setIgnoreMouseEvents(true);
+    overlayWin.loadURL(baseUrl + '/overlay.html');
+    overlayWin.on('page-title-updated', (evt, title) => {
+      evt.preventDefault();
+      if (title === 'SHOW_OVERLAY') {
+        const curDisp = screen.getPrimaryDisplay();
+        const cwa = curDisp.workArea;
+        overlayWin.setBounds({ x: cwa.x + cwa.width - ow - 8, y: cwa.y + cwa.height - oh - 8, width: ow, height: oh });
+        overlayWin.setIgnoreMouseEvents(true);
+        overlayWin.showInactive();
+        overlayWin.setAlwaysOnTop(true, 'screen-saver', 1);
+      } else if (title === 'HIDE_OVERLAY') {
+        overlayWin.hide();
+      }
+    });
   });
 
   app.on('window-all-closed', () => {
@@ -1820,24 +2745,24 @@ def ensure_electron_runtime():
         app_dir = os.path.join(ELECTRON_RUNTIME_DIR, "resources", "app")
         main_js_path = os.path.join(app_dir, "main.js")
         ico_path = os.path.join(app_dir, "logo.ico")
-        if not os.path.exists(main_js_path) or not os.path.exists(ico_path):
-            os.makedirs(app_dir, exist_ok=True)
-            try:
-                with open(os.path.join(app_dir, "package.json"), "w", encoding="utf-8") as f:
-                    json.dump({"name": "steam-switcher", "version": "2.0.0", "main": "main.js"}, f)
-                with open(main_js_path, "w", encoding="utf-8") as f:
-                    f.write(ELECTRON_MAIN_JS)
+        os.makedirs(app_dir, exist_ok=True)
+        try:
+            with open(os.path.join(app_dir, "package.json"), "w", encoding="utf-8") as f:
+                json.dump({"name": "steam-switcher", "version": "2.0.0", "main": "main.js"}, f)
+            with open(main_js_path, "w", encoding="utf-8") as f:
+                f.write(ELECTRON_MAIN_JS)
+            if not os.path.exists(ico_path):
                 ico_bytes = LOGO_ICO_BYTES or _load_asset_bytes("logo.ico")
                 if ico_bytes:
                     with open(ico_path, "wb") as f:
                         f.write(ico_bytes)
-            except Exception:
-                pass
+        except Exception:
+            pass
         return exe_path
     return None
 
 
-def open_app_window():
+def open_app_window(hidden=False):
     global ELECTRON_PROC
     url = f"http://127.0.0.1:{PORT}"
     ws = load_window_state()
@@ -1855,13 +2780,18 @@ def open_app_window():
         if x is not None and y is not None:
             args.append(f"--win-x={int(x)}")
             args.append(f"--win-y={int(y)}")
-        ELECTRON_PROC = subprocess.Popen(
+        if hidden:
+            args.append("--hidden")
+        proc = subprocess.Popen(
             args,
             cwd=ELECTRON_RUNTIME_DIR,
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         )
+        if ELECTRON_PROC is None or ELECTRON_PROC.poll() is not None:
+            ELECTRON_PROC = proc
         return
-    os.startfile(url)
+    if not hidden:
+        os.startfile(url)
 
 
 def shutdown_application():
@@ -1937,8 +2867,8 @@ if __name__ == "__main__":
 
     server = ThreadedHTTPServer(("127.0.0.1", PORT), LauncherRequestHandler)
     threading.Thread(target=build_full_state, daemon=True).start()
-    if not no_window:
-        open_app_window()
+    threading.Thread(target=global_game_watcher_loop, daemon=True).start()
+    open_app_window(hidden=no_window)
     start_system_tray()
     try:
         server.serve_forever()

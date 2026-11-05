@@ -34,6 +34,9 @@ Dirancang agar langsung terbuka dalam hitungan detik, mendeteksi seluruh akun da
 - **🕒 Riwayat Cloud Save (Maksimal 5 Versi) + Deteksi Save Aktif**
   - Menyimpan hingga **5 versi *save* terakhir** di server Cloud secara otomatis (versi lebih lama otomatis dibersihkan).
   - Membandingkan langsung isi folder *save* asli di Steam (`userdata` / dokumen *game*) dengan daftar versi di Cloud dan menandai versi mana yang **`✓ Sedang Digunakan`** tanpa membuat *folder backup* ganda di lokal.
+- **🏆 Personal Achievement Tracker (Khusus Save Anda)**
+  - Tetap bisa melihat dan mengumpulkan **Achievement Resmi Steam** meskipun bermain dalam **Mode Offline** atau menggunakan **Akun Sharing**.
+  - Mengisolasi data *achievement* khusus untuk *save* Anda sendiri (tidak tercampur dengan pemain lain di akun sharing) dan otomatis menyinkronkannya ke dalam paket **Cloud Save** Anda.
 - **📦 100% Portable Single `.exe`**
   - Seluruh pengaturan disimpan rapi di Windows Registry (`HKCU\Software\SteamSwitcher`), sehingga `SteamSwitcher.exe` dapat ditaruh di mana saja tanpa membuat *file* konfigurasi atau *folder* tambahan di sebelahnya.
   - Dilengkapi fitur **System Tray** (*On exit hide to tray* & *Start at Windows startup*).

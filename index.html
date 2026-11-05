@@ -625,6 +625,154 @@
       color: var(--text-muted);
     }
 
+    /* ACHIEVEMENT MODAL */
+    .ach-summary-bar {
+      padding: 12px 14px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      margin: 8px 0 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .ach-summary-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .ach-progress-track {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--bg-input);
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+
+    .ach-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3b82f6, #22c55e);
+      border-radius: 999px;
+      transition: width 0.25s ease;
+    }
+
+    .ach-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+
+    .ach-filter-group {
+      display: flex;
+      gap: 6px;
+    }
+
+    .ach-filter-btn {
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text-muted);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .ach-filter-btn.active {
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-text);
+      border-color: var(--border-active);
+    }
+
+    .ach-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 410px;
+      overflow-y: auto;
+      padding-right: 4px;
+      margin: 6px 0 12px;
+    }
+
+    .ach-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+    }
+
+    .ach-item.is-unlocked {
+      border-color: rgba(34, 197, 94, 0.5);
+      background: rgba(34, 197, 94, 0.07);
+    }
+
+    .ach-left {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .ach-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 7px;
+      object-fit: cover;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+    }
+
+    .ach-item:not(.is-unlocked) .ach-icon {
+      filter: grayscale(100%) opacity(0.65);
+    }
+
+    .ach-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .ach-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .ach-desc {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+
+    .ach-time {
+      font-size: 10.5px;
+      color: #4ade80;
+      font-weight: 600;
+    }
+
+    [data-theme="light"] .ach-time {
+      color: #15803d;
+    }
+
     .conflict-card {
       padding: 11px 13px;
       border-radius: 8px;
@@ -911,6 +1059,48 @@
       <div class="history-list" id="historyListBox"></div>
       <div class="modal-footer" style="justify-content:flex-end;">
         <button class="icon-btn" onclick="closeHistoryModal()">Tutup</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- PERSONAL ACHIEVEMENT MODAL (KHUSUS SAVE SAYA) -->
+  <div class="modal-backdrop" id="achievementModal" onclick="if(event.target===this)closeAchievementModal()">
+    <div class="modal-box" style="width:620px;max-width:95vw;padding:22px 24px;">
+      <h2 id="achModalTitle">🏆 Achievement Save Saya</h2>
+      <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:6px;">
+        Terdeteksi otomatis secara real-time saat bermain (muncul popup seperti Steam) & otomatis tersinkron ke akun Cloud Anda.
+      </div>
+      <div class="ach-summary-bar">
+        <div class="ach-summary-top">
+          <span id="achProgressLabel">Terbuka: 0 / 0 Achievement</span>
+          <span id="achPercentLabel" style="color:#4ade80;">0%</span>
+        </div>
+        <div class="ach-progress-track">
+          <div class="ach-progress-fill" id="achProgressBar" style="width:0%;"></div>
+        </div>
+      </div>
+      <div class="ach-toolbar">
+        <div class="ach-filter-group">
+          <button class="ach-filter-btn active" id="achFilterAll" onclick="setAchFilter('all')">Semua</button>
+          <button class="ach-filter-btn" id="achFilterUnlocked" onclick="setAchFilter('unlocked')">Terbuka</button>
+          <button class="ach-filter-btn" id="achFilterLocked" onclick="setAchFilter('locked')">Terkunci</button>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button class="btn-mini" title="Coba tampilkan popup notifikasi achievement di pojok kanan bawah layar" onclick="bulkAchievementAction('test_popup')">🔔 Tes Popup</button>
+          <button class="btn-mini" title="Sinkronkan achievement save ini dengan Server Cloud (agar sinkron antar PC)" onclick="bulkAchievementAction('sync_cloud')">☁ Sinkron Cloud</button>
+          <button class="btn-mini" title="Reset semua achievement save Anda ke 0 (Mulai Bersih)" onclick="askResetAchievements(true)">Reset ke 0</button>
+        </div>
+      </div>
+      <div id="achResetConfirmBar" style="display:none;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;border-radius:10px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);font-size:12px;">
+        <span style="color:var(--text-main);font-weight:600;">⚠️ Yakin ingin mereset semua achievement save ini ke 0?</span>
+        <div style="display:flex;gap:6px;flex-shrink:0;">
+          <button class="btn-mini" style="background:#ef4444;color:#fff;border-color:#ef4444;" onclick="confirmResetAchievements()">Ya, Reset</button>
+          <button class="btn-mini" onclick="askResetAchievements(false)">Batal</button>
+        </div>
+      </div>
+      <div class="ach-list" id="achListBox"></div>
+      <div class="modal-footer" style="justify-content:flex-end;">
+        <button class="icon-btn" onclick="closeAchievementModal()">Tutup</button>
       </div>
     </div>
   </div>
@@ -1209,16 +1399,25 @@
             <div class="card-info">
               <div class="game-title" title="${g.name}">${g.name}</div>
               <div style="display:flex;flex-direction:column;gap:7px;">
-                <label class="cloud-check-row" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()">
-                  <input
-                    type="checkbox"
-                    ${g.cloud_enabled ? 'checked' : ''}
-                    onchange="toggleGameCloud('${g.appid}', this.checked, '${safeName}')"
-                  />
-                  <span>Cloud Save</span>
-                </label>
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
+                  <label class="cloud-check-row" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()">
+                    <input
+                      type="checkbox"
+                      ${g.cloud_enabled ? 'checked' : ''}
+                      onchange="toggleGameCloud('${g.appid}', this.checked, '${safeName}')"
+                    />
+                    <span>Cloud Save</span>
+                  </label>
+                  ${g.ach_total > 0 ? `<span style="font-size:10.5px;font-weight:700;color:${g.ach_unlocked > 0 ? '#4ade80' : 'var(--text-muted)'};" title="Achievement Save Saya">🏆 ${g.ach_unlocked}/${g.ach_total}</span>` : ''}
+                </div>
                 <div class="card-btn-row">
                   <button class="btn-play-main ${isRun ? 'is-running' : (isUp ? 'is-uploading' : '')}" id="btn-play-${g.appid}">${btnContent}</button>
+                  <button
+                    class="btn-history-icon"
+                    title="Achievement Save Saya"
+                    onmousedown="event.stopPropagation()"
+                    onclick="event.stopPropagation(); openAchievementModal('${g.appid}', '${g.owner_account}', '${safeName}')"
+                  >🏆</button>
                   <button
                     class="btn-history-icon"
                     title="Riwayat Cloud Save (Maks 5)"
@@ -1257,7 +1456,11 @@
 
     let pendingConflict = null;
     let activeHistoryContext = null;
+    let activeAchContext = null;
+    let currentAchList = [];
+    let currentAchFilter = "all";
     const shownUploadTs = {};
+    const shownAchTs = {};
 
     function updateGameRunningDom(appid, isRunning, isUploading = false) {
       const gObj = appState.games.find(x => String(x.appid) === String(appid));
@@ -1328,6 +1531,15 @@
             if (upInfo.message && (upInfo.action === "uploaded" || upInfo.action === "downloaded")) {
               showToast(upInfo.message, 4000);
             }
+          }
+
+          const lastAchs = data.last_achievements || {};
+          const achInfo = lastAchs[aid];
+          if (achInfo && achInfo.ts && shownAchTs[aid] !== achInfo.ts) {
+            shownAchTs[aid] = achInfo.ts;
+            const tList = (achInfo.titles || []).join(", ");
+            showToast(`🏆 Achievement Terbuka (${g.name}): ${tList}`, 5000);
+            needRefresh = true;
           }
         }
         if (needRefresh) {
@@ -1473,6 +1685,162 @@
 
     function closeHistoryModal() {
       document.getElementById("historyModal").classList.remove("show");
+    }
+
+    const FALLBACK_ACH_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#1e293b"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="28">🏆</text></svg>`
+    );
+
+    function handleAchIconError(img) {
+      if (!img) return;
+      const cur = img.getAttribute("src") || "";
+      if (!img.dataset.triedCf && cur.includes("cdn.akamai.steamstatic.com")) {
+        img.dataset.triedCf = "1";
+        img.src = cur.replace("cdn.akamai.steamstatic.com", "cdn.cloudflare.steamstatic.com");
+        return;
+      }
+      img.onerror = null;
+      img.src = FALLBACK_ACH_SVG;
+    }
+
+    function askResetAchievements(show) {
+      const bar = document.getElementById("achResetConfirmBar");
+      if (bar) bar.style.display = show ? "flex" : "none";
+    }
+
+    async function confirmResetAchievements() {
+      askResetAchievements(false);
+      await bulkAchievementAction("reset_all");
+    }
+
+    async function openAchievementModal(appid, account, gameName) {
+      activeAchContext = { appid, account, gameName };
+      askResetAchievements(false);
+      document.getElementById("achModalTitle").textContent = `🏆 Achievement: ${gameName}`;
+      const box = document.getElementById("achListBox");
+      box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">Memuat daftar achievement dari Steam...</div>`;
+      document.getElementById("achievementModal").classList.add("show");
+
+      try {
+        const res = await fetch("/api/achievements", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, account })
+        });
+        const data = await res.json();
+        applyAchievementModalData(data);
+      } catch (e) {
+        box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">Gagal memuat daftar achievement.</div>`;
+      }
+    }
+
+    function closeAchievementModal() {
+      askResetAchievements(false);
+      document.getElementById("achievementModal").classList.remove("show");
+    }
+
+    function applyAchievementModalData(data) {
+      currentAchList = (data && data.achievements) || [];
+      const unlocked = Number(data && data.unlocked_count) || 0;
+      const total = Number(data && data.total_count) || 0;
+      const pct = total > 0 ? Math.round((unlocked / total) * 100) : 0;
+      document.getElementById("achProgressLabel").textContent = `Terbuka: ${unlocked} / ${total} Achievement`;
+      document.getElementById("achPercentLabel").textContent = `${pct}%`;
+      document.getElementById("achProgressBar").style.width = `${pct}%`;
+      renderAchievementList();
+    }
+
+    function setAchFilter(filter) {
+      currentAchFilter = filter;
+      document.getElementById("achFilterAll").classList.toggle("active", filter === "all");
+      document.getElementById("achFilterUnlocked").classList.toggle("active", filter === "unlocked");
+      document.getElementById("achFilterLocked").classList.toggle("active", filter === "locked");
+      renderAchievementList();
+    }
+
+    function renderAchievementList() {
+      const box = document.getElementById("achListBox");
+      if (!currentAchList || currentAchList.length === 0) {
+        box.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:12.5px;">Data schema achievement belum ditemukan di cache Steam lokal.<br/>Jalankan game ini minimal satu kali di Steam agar daftar achievement terunduh.</div>`;
+        return;
+      }
+      const filtered = currentAchList.filter(item => {
+        if (currentAchFilter === "unlocked") return Boolean(item.unlocked);
+        if (currentAchFilter === "locked") return !item.unlocked;
+        return true;
+      });
+      if (filtered.length === 0) {
+        box.innerHTML = `<div style="padding:22px;text-align:center;color:var(--text-muted);font-size:12px;">Tidak ada achievement pada filter ini.</div>`;
+        return;
+      }
+      box.innerHTML = filtered.map(item => {
+        const isUn = Boolean(item.unlocked);
+        const iconSrc = isUn ? (item.icon_url || item.icon_gray_url || FALLBACK_ACH_SVG) : (item.icon_gray_url || item.icon_url || FALLBACK_ACH_SVG);
+        const descText = item.description || (item.hidden ? "Hidden Achievement (Rahasia)" : "");
+        return `
+          <div class="ach-item ${isUn ? 'is-unlocked' : ''}">
+            <div class="ach-left">
+              <img class="ach-icon" src="${iconSrc}" alt="" loading="lazy" onerror="handleAchIconError(this)" />
+              <div class="ach-meta">
+                <div class="ach-title">
+                  <span>${item.title}</span>
+                  ${isUn ? '<span class="badge-used">✓ Terbuka</span>' : ''}
+                </div>
+                <div class="ach-desc">${descText}</div>
+                ${isUn && item.unlocked_at ? `<div class="ach-time">Didapat pada: ${formatUnixTime(item.unlocked_at)}</div>` : ''}
+              </div>
+            </div>
+            <button
+              class="btn-mini ${isUn ? 'is-used-btn' : ''}"
+              onclick="toggleAchievementItem('${item.key}', ${!isUn})"
+            >${isUn ? '✓ Terbuka' : 'Tandai'}</button>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function toggleAchievementItem(achKey, unlocked) {
+      if (!activeAchContext) return;
+      const { appid, account, gameName } = activeAchContext;
+      try {
+        const res = await fetch("/api/toggle_achievement", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, account, game_name: gameName, action: "toggle", ach_key: achKey, unlocked })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          applyAchievementModalData(data);
+          await refreshState();
+        }
+      } catch (e) {
+        showToast("Gagal memperbarui achievement.");
+      }
+    }
+
+    async function bulkAchievementAction(action) {
+      if (!activeAchContext) return;
+      const { appid, account, gameName } = activeAchContext;
+      if (action === "sync_cloud") {
+        showToast("Menyinkronkan achievement dengan Server Cloud...", 3000);
+      }
+      try {
+        const res = await fetch("/api/toggle_achievement", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, account, game_name: gameName, action })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          showToast(data.message || "Berhasil!", 3500);
+          applyAchievementModalData(data);
+          await refreshState();
+        } else {
+          showToast((data && data.message) || "Gagal memproses achievement.", 3500);
+        }
+      } catch (e) {
+        showToast("Gagal memproses achievement.");
+      }
     }
 
     async function restoreHistoryVersion(source, filename, mtime = 0) {
