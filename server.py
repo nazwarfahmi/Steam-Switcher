@@ -56,6 +56,9 @@ LAST_ACHIEVEMENT_UNLOCK = {}
 ACHIEVEMENT_POPUP_QUEUE = []
 POPUP_LOCK = threading.Lock()
 CLOUD_ACH_APPID = "999999999"
+PATCHES_META_CACHE = {}
+PATCHES_META_TS = 0
+PATCHES_FETCHING = False
 LAST_UI_ACTIVITY_TS = time.time()
 TRAY_ICON = None
 
@@ -192,10 +195,12 @@ def load_personal_achievements_raw():
             prof = _get_active_ach_profile()
             if prof != "_local":
                 profiles[prof] = dict(legacy)
-        data = {"profiles": profiles, "reset_at": {}}
+        data = {"profiles": profiles, "reset_at": {}, "locked_at": {}}
         _reg_write_json("PersonalAchievements", data)
     if not isinstance(data.get("reset_at"), dict):
         data["reset_at"] = {}
+    if not isinstance(data.get("locked_at"), dict):
+        data["locked_at"] = {}
     return data
 
 def save_personal_achievements_raw(data):
@@ -221,10 +226,26 @@ def get_game_reset_timestamp(appid):
     prof = _get_active_ach_profile()
     return int((raw.get("reset_at", {}).get(prof, {}) or {}).get(str(appid), 0) or 0)
 
-def set_game_personal_achievements(appid, ach_map, mark_reset=False):
+def get_game_locked_achievements(appid):
+    raw = load_personal_achievements_raw()
+    prof = _get_active_ach_profile()
+    locked_prof = raw.get("locked_at", {}).get(prof, {})
+    if not isinstance(locked_prof, dict):
+        return {}
+    game_locked = locked_prof.get(str(appid), {})
+    return dict(game_locked) if isinstance(game_locked, dict) else {}
+
+def set_game_personal_achievements(appid, ach_map, mark_reset=False, locked_key=None, unlocked_key=None):
     raw = load_personal_achievements_raw()
     prof = _get_active_ach_profile()
     prof_map = raw["profiles"].setdefault(prof, {})
+    locked_prof = raw.setdefault("locked_at", {}).setdefault(prof, {})
+    game_locked = locked_prof.setdefault(str(appid), {})
+    if not isinstance(game_locked, dict):
+        game_locked = {}
+        locked_prof[str(appid)] = game_locked
+
+    now_ts = int(time.time())
     clean_map = {}
     if isinstance(ach_map, dict):
         for k, v in ach_map.items():
@@ -233,9 +254,16 @@ def set_game_personal_achievements(appid, ach_map, mark_reset=False):
             except Exception:
                 pass
     prof_map[str(appid)] = clean_map
+    if locked_key:
+        game_locked[str(locked_key)] = now_ts
+    if unlocked_key:
+        game_locked.pop(str(unlocked_key), None)
+    for k in clean_map:
+        game_locked.pop(str(k), None)
     if mark_reset:
         rst_prof = raw["reset_at"].setdefault(prof, {})
-        rst_prof[str(appid)] = int(time.time())
+        rst_prof[str(appid)] = now_ts
+        locked_prof[str(appid)] = {}
     save_personal_achievements_raw(raw)
     return clean_map
 
@@ -506,6 +534,7 @@ def sync_cloud_achievements_bundle(steam_path=None, direction="both"):
     raw = load_personal_achievements_raw()
     local_prof = raw["profiles"].setdefault(username, {})
     local_rst = raw["reset_at"].setdefault(username, {})
+    local_locked = raw.setdefault("locked_at", {}).setdefault(username, {})
     changed_local = False
 
     # 1. Pull & merge from Cloud bundle if direction in ('both', 'pull')
@@ -518,26 +547,44 @@ def sync_cloud_achievements_bundle(steam_path=None, direction="both"):
                         bundle = json.loads(zf.read("achievements_bundle.json").decode("utf-8", errors="ignore"))
                         c_prof = bundle.get("unlocked", {}) if isinstance(bundle, dict) else {}
                         c_rst = bundle.get("reset_at", {}) if isinstance(bundle, dict) else {}
+                        c_locked = bundle.get("locked_at", {}) if isinstance(bundle, dict) else {}
                         if isinstance(c_rst, dict):
                             for aid, r_ts in c_rst.items():
                                 r_ts_i = int(r_ts or 0)
                                 cur_r = int(local_rst.get(str(aid), 0) or 0)
                                 if r_ts_i > cur_r:
                                     local_rst[str(aid)] = r_ts_i
-                                    # Drop local achievements unlocked before this reset
                                     cur_map = local_prof.get(str(aid), {})
                                     if isinstance(cur_map, dict):
                                         local_prof[str(aid)] = {k: v for k, v in cur_map.items() if int(v or 0) > r_ts_i}
                                     changed_local = True
+                        if isinstance(c_locked, dict):
+                            for aid, l_map in c_locked.items():
+                                if not isinstance(l_map, dict):
+                                    continue
+                                dest_l = local_locked.setdefault(str(aid), {})
+                                cur_u = local_prof.setdefault(str(aid), {})
+                                for k, l_ts in l_map.items():
+                                    l_ts_i = int(l_ts or 0)
+                                    if l_ts_i > int(dest_l.get(str(k), 0) or 0):
+                                        dest_l[str(k)] = l_ts_i
+                                        changed_local = True
+                                    if str(k) in cur_u and int(cur_u[str(k)] or 0) <= max(l_ts_i, int(dest_l.get(str(k), 0) or 0)):
+                                        cur_u.pop(str(k), None)
+                                        changed_local = True
                         if isinstance(c_prof, dict):
                             for aid, ach_map in c_prof.items():
                                 if not isinstance(ach_map, dict):
                                     continue
                                 rst_ts = int(local_rst.get(str(aid), 0) or 0)
+                                l_map = local_locked.get(str(aid), {})
+                                if not isinstance(l_map, dict):
+                                    l_map = {}
                                 dest = local_prof.setdefault(str(aid), {})
                                 for k, ts in ach_map.items():
                                     ts_i = int(ts or 0)
-                                    if ts_i > rst_ts and (str(k) not in dest or ts_i < int(dest[str(k)] or 0)):
+                                    k_lock_ts = int(l_map.get(str(k), 0) or 0)
+                                    if ts_i > rst_ts and ts_i > k_lock_ts and (str(k) not in dest or ts_i < int(dest[str(k)] or 0)):
                                         dest[str(k)] = ts_i
                                         changed_local = True
             except Exception:
@@ -558,7 +605,8 @@ def sync_cloud_achievements_bundle(steam_path=None, direction="both"):
                 "user": username,
                 "updated_at": int(time.time()),
                 "unlocked": local_prof,
-                "reset_at": local_rst
+                "reset_at": local_rst,
+                "locked_at": local_locked
             }, indent=2, ensure_ascii=False).encode("utf-8")
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -587,15 +635,23 @@ def capture_new_achievements_from_steam_bin(steam_path, sid3, appid, session_sta
         return []
     personal_map = get_game_personal_achievements(aid_s)
     rst_ts = get_game_reset_timestamp(aid_s)
+    locked_map = get_game_locked_achievements(aid_s)
     newly_unlocked_keys = []
+    stale_locked_seen = False
     now_ts = int(time.time())
     for k, ts in steam_unlocked.items():
         if k not in personal_map:
-            # Ignore stale achievements from before an explicit reset unless unlocked during this live session
             if rst_ts and ts < rst_ts and (not session_start_ts or ts < session_start_ts - 60):
+                stale_locked_seen = True
+                continue
+            lock_ts = int(locked_map.get(str(k), 0) or 0)
+            if lock_ts and ts <= lock_ts + 10:
+                stale_locked_seen = True
                 continue
             personal_map[k] = ts if (session_start_ts and ts >= session_start_ts - 120) else now_ts
             newly_unlocked_keys.append(k)
+    if stale_locked_seen and not newly_unlocked_keys:
+        apply_personal_achievements_to_steam_bin(steam_path, sid3, aid_s, personal_map)
     if newly_unlocked_keys:
         set_game_personal_achievements(aid_s, personal_map)
         schema = parse_game_achievement_schema(steam_path, aid_s)
@@ -772,6 +828,13 @@ def get_steam_registry_info():
     except Exception:
         pass
     return info
+
+def get_running_steam_appid():
+    reg = get_steam_registry_info()
+    r_aid = reg.get("running_appid", 0)
+    if r_aid and int(r_aid) > 0:
+        return str(r_aid)
+    return "0"
 
 def is_app_running_in_steam(appid):
     reg = get_steam_registry_info()
@@ -1083,8 +1146,15 @@ def unpack_save_zip_bytes(steam_path, appid, account_info, zip_bytes, mtime_to_a
             try:
                 ach_data = json.loads(zf.read("_personal_achievements.json").decode("utf-8", errors="ignore"))
                 if isinstance(ach_data, dict):
-                    set_game_personal_achievements(appid, ach_data)
-                    apply_personal_achievements_to_steam_bin(steam_path, account_info.get("steamid3", ""), appid, ach_data)
+                    rst_ts = get_game_reset_timestamp(appid)
+                    locked_map = get_game_locked_achievements(appid)
+                    filtered_ach = {}
+                    for k, v in ach_data.items():
+                        ts_i = int(v or 0)
+                        if ts_i > rst_ts and ts_i > int(locked_map.get(str(k), 0) or 0):
+                            filtered_ach[str(k)] = ts_i
+                    set_game_personal_achievements(appid, filtered_ach)
+                    apply_personal_achievements_to_steam_bin(steam_path, account_info.get("steamid3", ""), appid, filtered_ach)
             except Exception:
                 pass
         for member in zf.namelist():
@@ -1550,14 +1620,18 @@ def get_installed_games(steam_path):
                 if appid in NON_GAME_APPIDS:
                     continue
                 m_name = re.search(r'"name"\s+"([^"]+)"', txt)
+                m_idir = re.search(r'"installdir"\s+"([^"]+)"', txt)
                 m_size = re.search(r'"SizeOnDisk"\s+"(\d+)"', txt)
                 m_lp = re.search(r'"LastPlayed"\s+"(\d+)"', txt)
                 m_owner = re.search(r'"LastOwner"\s+"(\d+)"', txt)
 
                 size_bytes = int(m_size.group(1)) if m_size else 0
+                install_dir_name = m_idir.group(1) if m_idir else ""
+                install_dir_full = os.path.join(steamapps, "common", install_dir_name) if install_dir_name else ""
                 installed[appid] = {
                     "appid": appid,
                     "name": m_name.group(1) if m_name else f"App {appid}",
+                    "install_dir": install_dir_full,
                     "size_bytes": size_bytes,
                     "size_gb": round(size_bytes / (1024 ** 3), 2) if size_bytes > 0 else 0,
                     "last_played": int(m_lp.group(1)) if m_lp else 0,
@@ -1632,6 +1706,356 @@ def find_local_cover(steam_path, appid):
             return full_path
     return None
 
+def load_patched_games():
+    data = _reg_read_json("PatchedGames")
+    return data if isinstance(data, dict) else {}
+
+def save_patched_games(data):
+    if isinstance(data, dict):
+        _reg_write_json("PatchedGames", data)
+
+def fetch_cloud_patches_meta(force=False):
+    global PATCHES_META_CACHE, PATCHES_META_TS, PATCHES_FETCHING
+    now = time.time()
+    if not force and PATCHES_META_TS > 0 and (now - PATCHES_META_TS) < 45:
+        return PATCHES_META_CACHE
+
+    def _do_fetch():
+        global PATCHES_META_CACHE, PATCHES_META_TS, PATCHES_FETCHING
+        try:
+            resp, err = cloud_request("/api/patches", timeout=3.5)
+            if not err and isinstance(resp, dict) and isinstance(resp.get("patches"), dict):
+                PATCHES_META_CACHE = resp["patches"]
+                PATCHES_META_TS = time.time()
+            elif PATCHES_META_TS == 0:
+                PATCHES_META_TS = time.time() - 35
+        except Exception:
+            pass
+        finally:
+            PATCHES_FETCHING = False
+
+    if force:
+        PATCHES_FETCHING = True
+        _do_fetch()
+    elif not PATCHES_FETCHING:
+        PATCHES_FETCHING = True
+        threading.Thread(target=_do_fetch, daemon=True).start()
+    return PATCHES_META_CACHE
+
+LOCAL_FILE_HASH_CACHE = {}
+
+def _fast_local_sha256(fp):
+    if not fp or not os.path.isfile(fp):
+        return ""
+    try:
+        st = os.stat(fp)
+        key = (fp, int(st.st_mtime), int(st.st_size))
+        if key in LOCAL_FILE_HASH_CACHE:
+            return LOCAL_FILE_HASH_CACHE[key]
+        h = hashlib.sha256()
+        with open(fp, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        digest = h.hexdigest()
+        LOCAL_FILE_HASH_CACHE[key] = digest
+        return digest
+    except Exception:
+        return ""
+
+def find_local_patch_file(appid, game_name=""):
+    """Check if a local repacked mod exists in ../Translate/<game_name>/4_repacked_mod or %LOCALAPPDATA%/SteamSwitcher/patches/<appid>."""
+    aid_s = str(appid)
+    candidates = []
+    # 1. Prioritize sibling Translate/<game_name>/4_repacked_mod folder (author's local build)
+    for root_cand in [os.path.dirname(BASE_DIR), r"C:\Users\Nazwa\Pictures\Ngoding"]:
+        if game_name:
+            repack_dir = os.path.join(root_cand, "Translate", game_name, "4_repacked_mod")
+            if os.path.isdir(repack_dir):
+                for fn in os.listdir(repack_dir):
+                    fp = os.path.join(repack_dir, fn)
+                    if os.path.isfile(fp) and fn.lower().endswith(".pak"):
+                        candidates.append(fp)
+
+    # 2. Fallback to local downloaded cache
+    local_store = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "SteamSwitcher", "patches", aid_s)
+    if os.path.isdir(local_store):
+        for fn in os.listdir(local_store):
+            fp = os.path.join(local_store, fn)
+            if os.path.isfile(fp) and not fn.endswith(".tmp"):
+                candidates.append(fp)
+    return candidates[0] if candidates else None
+
+def find_local_original_backup(appid, game_name="", target_filename=""):
+    """Check if a local original backup exists in ../Translate/<game_name>/1_original_unpack."""
+    for root_cand in [os.path.dirname(BASE_DIR), r"C:\Users\Nazwa\Pictures\Ngoding"]:
+        if game_name:
+            orig_dir = os.path.join(root_cand, "Translate", game_name, "1_original_unpack")
+            if os.path.isdir(orig_dir):
+                for fn in os.listdir(orig_dir):
+                    if "ORIGINAL_BACKUP" in fn.upper() and fn.lower().endswith(".pak"):
+                        return os.path.join(orig_dir, fn)
+    return None
+
+def resolve_game_patch_target(install_dir, filename):
+    """Locate where filename (e.g. FFRS-Windows_0_P.pak) belongs inside the game's Steam install directory."""
+    if not install_dir or not os.path.isdir(install_dir) or not filename:
+        return None
+    fn_lower = os.path.basename(filename).lower()
+    for root, _, files in os.walk(install_dir):
+        for f in files:
+            if f.lower() == fn_lower:
+                return os.path.join(root, f)
+    # Fallback: look for Content/Paks directory for Unreal Engine .pak files
+    if fn_lower.endswith(".pak"):
+        for root, dirs, _ in os.walk(install_dir):
+            if os.path.basename(root).lower() == "paks" and "content" in root.lower():
+                return os.path.join(root, os.path.basename(filename))
+    return os.path.join(install_dir, os.path.basename(filename))
+
+def get_game_patch_info(appid, game_name, inst_info, cloud_patches=None):
+    """
+    Determine patch_status for a game:
+    - 'installed': Patch Bahasa Indonesia is currently installed in the game folder
+    - 'available': Patch Bahasa Indonesia is available (on Cloud Server or local Translate folder)
+    - 'none': No patch available for this game
+    """
+    aid_s = str(appid)
+    if cloud_patches is None:
+        cloud_patches = fetch_cloud_patches_meta(force=False)
+    server_info = cloud_patches.get(aid_s)
+    local_patch_fp = find_local_patch_file(aid_s, game_name)
+    has_patch_source = bool(server_info or local_patch_fp)
+
+    patched_reg = load_patched_games()
+    rec = patched_reg.get(aid_s, {})
+    install_dir = (inst_info or {}).get("install_dir", "")
+
+    patch_fname = ""
+    if server_info and server_info.get("primary_file"):
+        patch_fname = server_info["primary_file"]
+    elif local_patch_fp:
+        patch_fname = os.path.basename(local_patch_fp)
+    elif rec.get("filename"):
+        patch_fname = rec["filename"]
+
+    target_fp = rec.get("target_path", "")
+    if (not target_fp or not os.path.exists(target_fp)) and install_dir and patch_fname:
+        target_fp = resolve_game_patch_target(install_dir, patch_fname) or ""
+
+    is_patched_now = False
+    if inst_info and install_dir and os.path.isdir(install_dir):
+        if rec.get("status") == "installed" and target_fp and os.path.exists(target_fp):
+            is_patched_now = True
+        elif rec.get("status") != "unpatched" and target_fp and os.path.exists(target_fp):
+            # Auto-detect if target file matches patched size or has .orig_backup
+            try:
+                cur_sz = os.path.getsize(target_fp)
+                if os.path.exists(target_fp + ".orig_backup"):
+                    is_patched_now = True
+                elif local_patch_fp and os.path.exists(local_patch_fp) and cur_sz == os.path.getsize(local_patch_fp):
+                    orig_b = find_local_original_backup(aid_s, game_name, patch_fname)
+                    if not orig_b or cur_sz != os.path.getsize(orig_b):
+                        is_patched_now = True
+                elif server_info and server_info.get("total_size_bytes") and cur_sz == int(server_info["total_size_bytes"]):
+                    is_patched_now = True
+            except Exception:
+                pass
+            if is_patched_now:
+                patched_reg[aid_s] = {
+                    "status": "installed",
+                    "filename": patch_fname,
+                    "target_path": target_fp,
+                    "patched_at": int(os.path.getmtime(target_fp))
+                }
+                save_patched_games(patched_reg)
+
+    if is_patched_now:
+        status = "installed"
+    elif has_patch_source:
+        status = "available"
+    else:
+        status = "none"
+
+    has_update = False
+    if is_patched_now and target_fp and os.path.exists(target_fp):
+        installed_sha = _fast_local_sha256(target_fp)
+        if installed_sha:
+            server_sha = (server_info or {}).get("primary_sha256", "")
+            local_sha = _fast_local_sha256(local_patch_fp) if (local_patch_fp and os.path.exists(local_patch_fp)) else ""
+            if server_sha and installed_sha != server_sha:
+                has_update = True
+            elif local_sha and installed_sha != local_sha:
+                has_update = True
+
+    return {
+        "patch_status": status,
+        "patch_has_update": has_update,
+        "patch_filename": patch_fname,
+        "patch_target": target_fp,
+        "patch_in_server": bool(server_info),
+        "patch_has_local": bool(local_patch_fp and "4_repacked_mod" in local_patch_fp),
+        "patch_local_path": local_patch_fp or ""
+    }
+
+def install_game_patch(steam_path, appid, game_name):
+    aid_s = str(appid)
+    if is_app_running_in_steam(aid_s):
+        return False, f"Tutup game '{game_name}' terlebih dahulu sebelum memasang patch Bahasa Indonesia."
+    installed = get_installed_games(steam_path)
+    inst_info = installed.get(aid_s)
+    if not inst_info or not inst_info.get("install_dir") or not os.path.isdir(inst_info["install_dir"]):
+        return False, f"Game '{game_name}' belum terinstal di PC ini."
+
+    install_dir = inst_info["install_dir"]
+    cloud_patches = fetch_cloud_patches_meta(force=True)
+    server_info = cloud_patches.get(aid_s)
+    local_patch_fp = find_local_patch_file(aid_s, game_name)
+
+    patch_fname = ""
+    tmp_downloaded = None
+    source_fp = None
+
+    # 1. Try downloading from Cloud Server first if available
+    if server_info:
+        patch_fname = server_info.get("primary_file") or "patch.pak"
+        cfg = load_cloud_config()
+        base_url = cfg.get("server_url", "").rstrip("/")
+        if base_url:
+            try:
+                req = urllib.request.Request(
+                    f"{base_url}/api/patches/{aid_s}/download",
+                    headers={"User-Agent": "SteamSwitcherCloud/2.0"}
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    hdr_fn = urllib.parse.unquote(resp.headers.get("X-Patch-Filename", "")).strip()
+                    if hdr_fn:
+                        patch_fname = os.path.basename(hdr_fn)
+                    tmp_dir = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "SteamSwitcher", "patches", aid_s)
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    tmp_downloaded = os.path.join(tmp_dir, patch_fname)
+                    with open(tmp_downloaded + ".tmp", "wb") as out_f:
+                        shutil.copyfileobj(resp, out_f, length=1024 * 1024)
+                    os.replace(tmp_downloaded + ".tmp", tmp_downloaded)
+                    source_fp = tmp_downloaded
+            except Exception as e:
+                if not local_patch_fp:
+                    return False, f"Gagal mengunduh patch dari Server Cloud: {e}"
+
+    # 2. Fallback to local repacked mod if not on server yet
+    if not source_fp and local_patch_fp and os.path.exists(local_patch_fp):
+        source_fp = local_patch_fp
+        patch_fname = os.path.basename(local_patch_fp)
+
+    if not source_fp or not os.path.exists(source_fp):
+        return False, f"File patch Bahasa Indonesia untuk '{game_name}' belum tersedia di Server Cloud."
+
+    target_fp = resolve_game_patch_target(install_dir, patch_fname)
+    if not target_fp:
+        return False, "Gagal menemukan lokasi folder instalasi patch di dalam folder game."
+
+    os.makedirs(os.path.dirname(target_fp), exist_ok=True)
+    backup_fp = target_fp + ".orig_backup"
+
+    # Backup original file before replacing if backup doesn't exist yet
+    if not os.path.exists(backup_fp):
+        ext_orig = find_local_original_backup(aid_s, game_name, patch_fname)
+        if ext_orig and os.path.exists(ext_orig):
+            try:
+                shutil.copy2(ext_orig, backup_fp)
+            except Exception:
+                pass
+        elif os.path.exists(target_fp) and os.path.getsize(target_fp) != os.path.getsize(source_fp):
+            try:
+                shutil.copy2(target_fp, backup_fp)
+            except Exception:
+                pass
+
+    try:
+        shutil.copy2(source_fp, target_fp)
+    except Exception as e:
+        return False, f"Gagal memasang file patch ke folder game: {e}"
+
+    patched_reg = load_patched_games()
+    patched_reg[aid_s] = {
+        "status": "installed",
+        "filename": patch_fname,
+        "target_path": target_fp,
+        "patched_at": int(time.time()),
+        "size_bytes": os.path.getsize(target_fp)
+    }
+    save_patched_games(patched_reg)
+    build_full_state()
+    return True, f"Patch Bahasa Indonesia berhasil dipasang untuk '{game_name}'!"
+
+def uninstall_game_patch(steam_path, appid, game_name):
+    aid_s = str(appid)
+    if is_app_running_in_steam(aid_s):
+        return False, f"Tutup game '{game_name}' terlebih dahulu sebelum melepas patch."
+    installed = get_installed_games(steam_path)
+    inst_info = installed.get(aid_s)
+    patched_reg = load_patched_games()
+    rec = patched_reg.get(aid_s, {})
+    target_fp = rec.get("target_path", "")
+    if not target_fp and inst_info and inst_info.get("install_dir"):
+        p_info = get_game_patch_info(aid_s, game_name, inst_info)
+        target_fp = p_info.get("patch_target", "")
+
+    if not target_fp:
+        return False, "Lokasi file patch tidak ditemukan."
+
+    backup_fp = target_fp + ".orig_backup"
+    if not os.path.exists(backup_fp):
+        ext_orig = find_local_original_backup(aid_s, game_name, os.path.basename(target_fp))
+        if ext_orig and os.path.exists(ext_orig):
+            backup_fp = ext_orig
+        else:
+            return False, "File backup original belum ditemukan, gunakan Verify Integrity di Steam untuk mengembalikan file asli."
+
+    try:
+        shutil.copy2(backup_fp, target_fp)
+    except Exception as e:
+        return False, f"Gagal mengembalikan file original: {e}"
+
+    patched_reg[aid_s] = {
+        "status": "unpatched",
+        "filename": os.path.basename(target_fp),
+        "target_path": target_fp,
+        "updated_at": int(time.time())
+    }
+    save_patched_games(patched_reg)
+    build_full_state()
+    return True, f"File original '{game_name}' berhasil dikembalikan (Patch dilepas)."
+
+def upload_local_patch_to_cloud(appid, game_name):
+    aid_s = str(appid)
+    cfg = load_cloud_config()
+    base_url = cfg.get("server_url", "").rstrip("/")
+    username = cfg.get("username", "")
+    password = cfg.get("password", "")
+    if not base_url or not username or not password:
+        return False, "Silakan Login Cloud terlebih dahulu di kanan atas launcher."
+
+    local_fp = find_local_patch_file(aid_s, game_name)
+    if not local_fp or not os.path.exists(local_fp):
+        return False, f"File patch lokal untuk '{game_name}' tidak ditemukan."
+
+    fname = os.path.basename(local_fp)
+    raw_bytes = open(local_fp, "rb").read()
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Patch-Filename": urllib.parse.quote(fname)
+    }
+    resp, err = cloud_request(f"/api/patches/{aid_s}/upload", method="POST", body=raw_bytes, headers=headers, timeout=180)
+    if err or not isinstance(resp, dict) or not resp.get("ok"):
+        return False, f"Gagal upload patch ke Server Cloud: {err or 'Pastikan cloud_server.py di server sudah diperbarui.'}"
+
+    fetch_cloud_patches_meta(force=True)
+    build_full_state()
+    return True, resp.get("message", f"Patch '{fname}' berhasil di-upload ke Server Cloud!")
+
 def build_full_state():
     global STATE_CACHE
     reg = get_steam_registry_info()
@@ -1651,6 +2075,7 @@ def build_full_state():
     uploading_ids = set(get_uploading_appids())
     cloud_cfg_now = load_cloud_config()
     enabled_cloud_ids = set(cloud_cfg_now.get("enabled_appids", []))
+    cloud_patches = fetch_cloud_patches_meta(force=False)
 
     games_list = []
     for aid in all_appids:
@@ -1698,6 +2123,7 @@ def build_full_state():
         pers_ach = get_game_personal_achievements(aid)
         valid_ach_keys = {x["key"] for x in ach_schema}
         ach_unlocked_cnt = sum(1 for k, v in pers_ach.items() if v and (not valid_ach_keys or k in valid_ach_keys))
+        patch_info = get_game_patch_info(aid, name, inst_info, cloud_patches)
 
         games_list.append({
             "appid": aid,
@@ -1717,7 +2143,8 @@ def build_full_state():
             "has_local_save": len(save_files) > 0,
             "local_save_mtime": save_mtime,
             "ach_unlocked": ach_unlocked_cnt,
-            "ach_total": len(ach_schema)
+            "ach_total": len(ach_schema),
+            **patch_info
         })
 
     games_list.sort(key=lambda g: (g["name"].lower(), g["appid"]))
@@ -2157,6 +2584,7 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 pers_map = {}
                 set_game_personal_achievements(appid, pers_map, mark_reset=True)
                 msg_out = f"Seluruh achievement '{game_name}' berhasil di-reset ke 0."
+                sync_dir = "push"
             elif action == "sync_cloud":
                 cfg = load_cloud_config()
                 if not cfg.get("server_url") or not cfg.get("username"):
@@ -2165,6 +2593,7 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 sync_cloud_achievements_bundle(steam_path, direction="both")
                 pers_map = get_game_personal_achievements(appid)
                 rst_ts = get_game_reset_timestamp(appid)
+                locked_map = get_game_locked_achievements(appid)
                 dl_bytes, dl_err = cloud_request(f"/api/saves/{appid}/download", timeout=12)
                 cloud_ach = {}
                 if not dl_err and isinstance(dl_bytes, bytes):
@@ -2179,25 +2608,29 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 for k, ts in cloud_ach.items():
                     try:
                         ts_i = int(ts)
-                        if ts_i > rst_ts and (k not in pers_map or ts_i < pers_map[k]):
+                        k_lock_ts = int(locked_map.get(str(k), 0) or 0)
+                        if ts_i > rst_ts and ts_i > k_lock_ts and (k not in pers_map or ts_i < pers_map[k]):
                             pers_map[str(k)] = ts_i
                     except Exception:
                         pass
                 set_game_personal_achievements(appid, pers_map)
                 msg_out = f"Sinkronisasi Cloud selesai! ({len(pers_map)} achievement tersinkron untuk '{game_name}')"
+                sync_dir = "both"
             else:
                 if unlocked:
                     pers_map[ach_key] = int(time.time())
+                    set_game_personal_achievements(appid, pers_map, unlocked_key=ach_key)
                     msg_out = "Achievement ditandai terbuka!"
                     ach_item = schema_by_key.get(ach_key, {"key": ach_key, "title": ach_key, "description": "", "icon_url": ""})
                     enqueue_achievement_popup(appid, game_name, ach_item, len(pers_map), len(schema))
                 else:
                     pers_map.pop(ach_key, None)
+                    set_game_personal_achievements(appid, pers_map, locked_key=ach_key)
                     msg_out = "Achievement dikunci kembali."
-                set_game_personal_achievements(appid, pers_map)
+                sync_dir = "push"
 
             apply_personal_achievements_to_steam_bin(steam_path, sid3, appid, pers_map)
-            threading.Thread(target=sync_cloud_achievements_bundle, args=(steam_path, "both"), daemon=True).start()
+            threading.Thread(target=sync_cloud_achievements_bundle, args=(steam_path, sync_dir), daemon=True).start()
             if is_game_cloud_enabled(appid) or action == "sync_cloud":
                 threading.Thread(
                     target=sync_game_save,
@@ -2376,6 +2809,28 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "message": summary})
             return
 
+        if self.path == "/api/game_patch":
+            appid = str(payload.get("appid", "")).strip()
+            game_name = payload.get("game_name", "").strip() or f"App {appid}"
+            action = payload.get("action", "install").strip()
+            reg = get_steam_registry_info()
+            steam_path = reg["steam_path"]
+            if action == "install":
+                ok_p, msg_p = install_game_patch(steam_path, appid, game_name)
+            elif action == "uninstall":
+                ok_p, msg_p = uninstall_game_patch(steam_path, appid, game_name)
+            elif action == "upload_server":
+                ok_p, msg_p = upload_local_patch_to_cloud(appid, game_name)
+            else:
+                installed = get_installed_games(steam_path)
+                p_info = get_game_patch_info(appid, game_name, installed.get(appid), fetch_cloud_patches_meta(force=True))
+                self.send_json({"ok": True, **p_info})
+                return
+            installed = get_installed_games(steam_path)
+            p_info = get_game_patch_info(appid, game_name, installed.get(appid))
+            self.send_json({"ok": ok_p, "message": msg_p, **p_info})
+            return
+
         self.send_error(404)
 
 
@@ -2385,12 +2840,12 @@ def is_port_in_use(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-ELECTRON_RUNTIME_DIR = os.path.join(
+WEBVIEW2_HOST_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", tempfile.gettempdir()),
     "SteamSwitcher",
-    "electron_v30"
+    "wv2_host"
 )
-ELECTRON_PROC = None
+UI_HOST_PROC = None
 
 OVERLAY_HTML_PAGE = """<!DOCTYPE html>
 <html lang="id">
@@ -2580,199 +3035,40 @@ OVERLAY_HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
-ELECTRON_MAIN_JS = """const { app, BrowserWindow, screen } = require('electron');
-const path = require('path');
-const os = require('os');
+def ensure_webview2_host():
+    """Ensure the bundled ~1MB native C# WebView2 host is unpacked to WEBVIEW2_HOST_DIR."""
+    exe_path = os.path.join(WEBVIEW2_HOST_DIR, "SteamSwitcherUI.exe")
+    bundled_dir = os.path.join(ASSET_DIR, "webview2_runtime")
+    if not os.path.isdir(bundled_dir):
+        bundled_dir = os.path.join(BASE_DIR, "webview2_runtime")
 
-app.setPath('userData', path.join(os.tmpdir(), 'SteamSwitcher_ElectronProfile'));
-app.commandLine.appendSwitch('disable-extensions');
-app.commandLine.appendSwitch('disable-sync');
-app.commandLine.appendSwitch('disable-features', 'Translate');
-app.commandLine.appendSwitch('no-proxy-server');
-app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-  app.quit();
-} else {
-  let win = null;
-  let overlayWin = null;
-  let baseUrl = 'http://127.0.0.1:18420';
-
-  app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
-    }
-  });
-
-  app.whenReady().then(() => {
-    const args = process.argv;
-    let w = 1280, h = 820, x = undefined, y = undefined;
-    let hideMain = false;
-    for (const a of args) {
-      if (a.startsWith('--app-url=')) baseUrl = a.split('=')[1];
-      if (a.startsWith('--win-w=')) w = parseInt(a.split('=')[1], 10) || 1280;
-      if (a.startsWith('--win-h=')) h = parseInt(a.split('=')[1], 10) || 820;
-      if (a.startsWith('--win-x=')) x = parseInt(a.split('=')[1], 10);
-      if (a.startsWith('--win-y=')) y = parseInt(a.split('=')[1], 10);
-      if (a === '--hidden') hideMain = true;
-    }
-
-    const opts = {
-      width: Math.max(600, w),
-      height: Math.max(420, h),
-      minWidth: 680,
-      minHeight: 480,
-      backgroundColor: '#0b0f19',
-      autoHideMenuBar: true,
-      show: !hideMain,
-      icon: path.join(__dirname, 'logo.ico'),
-      title: 'Steam Switcher',
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true
-      }
-    };
-    if (typeof x === 'number' && !isNaN(x) && typeof y === 'number' && !isNaN(y)) {
-      opts.x = x;
-      opts.y = y;
-    }
-
-    win = new BrowserWindow(opts);
-    win.setMenuBarVisibility(false);
-    win.loadURL(baseUrl);
-
-    win.on('close', (e) => {
-      if (!app.isQuiting) {
-        e.preventDefault();
-        const b = win.getBounds();
-        fetch(baseUrl + '/api/window_closed', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ width: b.width, height: b.height, x: b.x, y: b.y })
-        }).catch(() => {});
-        win.hide();
-      }
-    });
-
-    // Topmost non-focusable overlay window for Steam-style Achievement Unlocks
-    const disp = screen.getPrimaryDisplay();
-    const wa = disp.workArea;
-    const ow = 392, oh = 116;
-    overlayWin = new BrowserWindow({
-      width: ow,
-      height: oh,
-      x: wa.x + wa.width - ow - 8,
-      y: wa.y + wa.height - oh - 8,
-      frame: false,
-      transparent: true,
-      resizable: false,
-      movable: false,
-      minimizable: false,
-      maximizable: false,
-      closable: false,
-      focusable: false,
-      skipTaskbar: true,
-      alwaysOnTop: true,
-      show: false,
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        backgroundThrottling: false
-      }
-    });
-    overlayWin.setIgnoreMouseEvents(true);
-    overlayWin.loadURL(baseUrl + '/overlay.html');
-    overlayWin.on('page-title-updated', (evt, title) => {
-      evt.preventDefault();
-      if (title === 'SHOW_OVERLAY') {
-        const curDisp = screen.getPrimaryDisplay();
-        const cwa = curDisp.workArea;
-        overlayWin.setBounds({ x: cwa.x + cwa.width - ow - 8, y: cwa.y + cwa.height - oh - 8, width: ow, height: oh });
-        overlayWin.setIgnoreMouseEvents(true);
-        overlayWin.showInactive();
-        overlayWin.setAlwaysOnTop(true, 'screen-saver', 1);
-      } else if (title === 'HIDE_OVERLAY') {
-        overlayWin.hide();
-      }
-    });
-  });
-
-  app.on('window-all-closed', () => {
-    app.quit();
-  });
-}
-"""
-
-
-def ensure_electron_runtime():
-    exe_path = os.path.join(ELECTRON_RUNTIME_DIR, "electron.exe")
-    if not os.path.exists(exe_path):
-        # 1. Check local Electron cache on PC if available
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        cache_root = os.path.join(local_app_data, "electron", "Cache")
-        if os.path.isdir(cache_root):
-            for root, _, files in os.walk(cache_root):
-                for fn in files:
-                    if fn.startswith("electron-") and fn.endswith("-win32-x64.zip"):
-                        zp = os.path.join(root, fn)
-                        try:
-                            os.makedirs(ELECTRON_RUNTIME_DIR, exist_ok=True)
-                            with zipfile.ZipFile(zp, "r") as zf:
-                                zf.extractall(ELECTRON_RUNTIME_DIR)
-                            break
-                        except Exception:
-                            pass
-                if os.path.exists(exe_path):
-                    break
-
-    if not os.path.exists(exe_path):
-        # 2. Auto-bootstrap portable Electron v30.5.1 runtime on first run on a new PC
-        dl_url = "https://github.com/electron/electron/releases/download/v30.5.1/electron-v30.5.1-win32-x64.zip"
-        try:
-            os.makedirs(ELECTRON_RUNTIME_DIR, exist_ok=True)
-            req = urllib.request.Request(dl_url, headers={"User-Agent": "SteamSwitcher/2.0"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                raw_zip = resp.read()
-            with zipfile.ZipFile(io.BytesIO(raw_zip), "r") as zf:
-                zf.extractall(ELECTRON_RUNTIME_DIR)
-        except Exception:
-            pass
-
+    if os.path.isdir(bundled_dir):
+        os.makedirs(WEBVIEW2_HOST_DIR, exist_ok=True)
+        for fn in os.listdir(bundled_dir):
+            src = os.path.join(bundled_dir, fn)
+            dst = os.path.join(WEBVIEW2_HOST_DIR, fn)
+            if os.path.isfile(src):
+                try:
+                    if not os.path.exists(dst) or os.path.getsize(src) != os.path.getsize(dst):
+                        shutil.copy2(src, dst)
+                except Exception:
+                    pass
     if os.path.exists(exe_path):
-        app_dir = os.path.join(ELECTRON_RUNTIME_DIR, "resources", "app")
-        main_js_path = os.path.join(app_dir, "main.js")
-        ico_path = os.path.join(app_dir, "logo.ico")
-        os.makedirs(app_dir, exist_ok=True)
-        try:
-            with open(os.path.join(app_dir, "package.json"), "w", encoding="utf-8") as f:
-                json.dump({"name": "steam-switcher", "version": "2.0.0", "main": "main.js"}, f)
-            with open(main_js_path, "w", encoding="utf-8") as f:
-                f.write(ELECTRON_MAIN_JS)
-            if not os.path.exists(ico_path):
-                ico_bytes = LOGO_ICO_BYTES or _load_asset_bytes("logo.ico")
-                if ico_bytes:
-                    with open(ico_path, "wb") as f:
-                        f.write(ico_bytes)
-        except Exception:
-            pass
         return exe_path
     return None
 
 
 def open_app_window(hidden=False):
-    global ELECTRON_PROC
+    global UI_HOST_PROC
     url = f"http://127.0.0.1:{PORT}"
     ws = load_window_state()
     w, h = ws.get("width", 1280), ws.get("height", 820)
     x, y = ws.get("x"), ws.get("y")
 
-    electron_exe = ensure_electron_runtime()
-    if electron_exe and os.path.exists(electron_exe):
+    host_exe = ensure_webview2_host()
+    if host_exe and os.path.exists(host_exe):
         args = [
-            electron_exe,
+            host_exe,
             f"--app-url={url}",
             f"--win-w={w}",
             f"--win-h={h}",
@@ -2784,21 +3080,31 @@ def open_app_window(hidden=False):
             args.append("--hidden")
         proc = subprocess.Popen(
             args,
-            cwd=ELECTRON_RUNTIME_DIR,
+            cwd=WEBVIEW2_HOST_DIR,
             creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         )
-        if ELECTRON_PROC is None or ELECTRON_PROC.poll() is not None:
-            ELECTRON_PROC = proc
+        if UI_HOST_PROC is None or UI_HOST_PROC.poll() is not None:
+            UI_HOST_PROC = proc
         return
     if not hidden:
         os.startfile(url)
 
 
 def shutdown_application():
-    global TRAY_ICON, ELECTRON_PROC
+    global TRAY_ICON, UI_HOST_PROC
     try:
-        if ELECTRON_PROC is not None and ELECTRON_PROC.poll() is None:
-            ELECTRON_PROC.terminate()
+        if UI_HOST_PROC is not None and UI_HOST_PROC.poll() is None:
+            UI_HOST_PROC.terminate()
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "SteamSwitcherUI.exe"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2
+        )
     except Exception:
         pass
     try:

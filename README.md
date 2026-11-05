@@ -79,7 +79,7 @@ Jika Anda ingin menggunakan fitur **Cloud Save** lintas PC:
    ```
 2. **Build menjadi satu file `SteamSwitcher.exe` (Portable):**
    ```powershell
-   pyinstaller --noconfirm --onefile --windowed --name "SteamSwitcher" --icon "logo.ico" --add-data "index.html;." --add-data "logo.png;." --add-data "logo.ico;." server.py
+   pyinstaller --noconfirm --onefile --windowed --name "SteamSwitcher" --icon "logo.ico" --add-data "index.html;." --add-data "logo.png;." --add-data "logo.ico;." --add-data "webview2_runtime;webview2_runtime" server.py
    ```
    File hasil *build* akan tersedia di folder `dist/SteamSwitcher.exe`.
 
@@ -127,6 +127,7 @@ Folder [`cloud-server/`](./cloud-server) berisi *backend* ringan untuk menyimpan
 ├── server.py                  # Aplikasi utama Desktop, Steam Parser, & Cloud Sync Engine
 ├── index.html                 # Antarmuka pengguna (UI) berbasis tema Gelap & Terang
 ├── logo.png / logo.ico        # Aset ikon aplikasi & System Tray
+├── webview2_runtime/          # Native C# WinForms + WebView2 Host ringan (~1 MB)
 ├── cloud-server/
 │   ├── cloud_server.py        # Server API Cloud Save mandiri (Multi-user & 5-Version History)
 │   ├── Dockerfile             # Konfigurasi image Docker

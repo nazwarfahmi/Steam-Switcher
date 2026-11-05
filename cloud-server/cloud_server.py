@@ -11,11 +11,14 @@ from socketserver import ThreadingMixIn
 
 PORT = int(os.environ.get("PORT", "8765"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data/saves")
+PATCHES_DIR = os.path.join(DATA_DIR, "patches")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "5"))
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 USERS_LOCK = threading.Lock()
+PATCH_HASH_CACHE = {}
 
 os.makedirs(os.path.join(DATA_DIR, "users"), exist_ok=True)
+os.makedirs(PATCHES_DIR, exist_ok=True)
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -112,6 +115,76 @@ def get_app_history_list(username, appid):
     return items
 
 
+def _fast_file_sha256(fp):
+    try:
+        st = os.stat(fp)
+        key = (fp, int(st.st_mtime), int(st.st_size))
+        if key in PATCH_HASH_CACHE:
+            return PATCH_HASH_CACHE[key]
+        h = hashlib.sha256()
+        with open(fp, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        digest = h.hexdigest()
+        PATCH_HASH_CACHE[key] = digest
+        return digest
+    except Exception:
+        return ""
+
+
+def get_all_patches_meta():
+    result = {}
+    if not os.path.isdir(PATCHES_DIR):
+        return result
+    for appid in os.listdir(PATCHES_DIR):
+        if not appid.isdigit():
+            continue
+        app_patch_dir = os.path.join(PATCHES_DIR, appid)
+        if not os.path.isdir(app_patch_dir):
+            continue
+        files_meta = []
+        latest_mtime = 0
+        total_size = 0
+        for root, _, files in os.walk(app_patch_dir):
+            for fn in files:
+                if fn.endswith(".tmp") or fn.startswith("."):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                    mt = int(os.path.getmtime(fp))
+                except Exception:
+                    continue
+                if sz <= 0:
+                    continue
+                rel_p = os.path.relpath(fp, app_patch_dir).replace("\\", "/")
+                sha = _fast_file_sha256(fp)
+                if mt > latest_mtime:
+                    latest_mtime = mt
+                total_size += sz
+                files_meta.append({
+                    "name": fn,
+                    "rel_path": rel_p,
+                    "size_bytes": sz,
+                    "mtime": mt,
+                    "sha256": sha
+                })
+        if files_meta:
+            files_meta.sort(key=lambda x: x["rel_path"])
+            result[appid] = {
+                "appid": appid,
+                "files": files_meta,
+                "primary_file": files_meta[0]["name"],
+                "primary_sha256": files_meta[0]["sha256"],
+                "total_size_bytes": total_size,
+                "updated_at": latest_mtime
+            }
+    return result
+
+
 class CloudSaveHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {fmt % args}", flush=True)
@@ -160,7 +233,38 @@ class CloudSaveHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "saves": get_all_user_meta(username)})
             return
 
+        if path == "/api/patches":
+            self.send_json({"ok": True, "patches": get_all_patches_meta()})
+            return
+
         parts = path.split("/")
+        # /api/patches/<appid>/download
+        if len(parts) == 5 and parts[1] == "api" and parts[2] == "patches" and parts[4] == "download":
+            appid = parts[3]
+            if not appid.isdigit():
+                self.send_json({"ok": False, "error": "Invalid appid"}, 400)
+                return
+            patches = get_all_patches_meta()
+            p_info = patches.get(appid)
+            if not p_info or not p_info.get("files"):
+                self.send_json({"ok": False, "error": "Patch belum tersedia di server untuk game ini"}, 404)
+                return
+            first_file = p_info["files"][0]
+            fp = os.path.join(PATCHES_DIR, appid, first_file["rel_path"].replace("/", os.sep))
+            if not os.path.exists(fp):
+                self.send_json({"ok": False, "error": "File patch tidak ditemukan"}, 404)
+                return
+            sz = os.path.getsize(fp)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(sz))
+            self.send_header("X-Patch-Filename", urllib.parse.quote(first_file["name"]))
+            self.send_header("X-Patch-RelPath", urllib.parse.quote(first_file["rel_path"]))
+            self.send_header("X-Patch-Sha256", first_file["sha256"])
+            self.end_headers()
+            with open(fp, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, length=1024 * 1024)
+            return
         # /api/saves/<appid>/meta
         if len(parts) == 5 and parts[1] == "api" and parts[2] == "saves" and parts[4] == "meta":
             username = self.authenticate_user()
@@ -268,6 +372,55 @@ class CloudSaveHandler(BaseHTTPRequestHandler):
                 return
 
         parts = path.split("/")
+        # /api/patches/<appid>/upload
+        if len(parts) == 5 and parts[1] == "api" and parts[2] == "patches" and parts[4] == "upload":
+            username = self.authenticate_user()
+            if not username:
+                return
+            appid = parts[3]
+            if not appid.isdigit():
+                self.send_json({"ok": False, "error": "Invalid appid"}, 400)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 1024 * 1024 * 1024:
+                self.send_json({"ok": False, "error": "Invalid patch payload size"}, 400)
+                return
+            raw_fname = urllib.parse.unquote(self.headers.get("X-Patch-Filename", "patch.pak")).strip()
+            safe_fname = os.path.basename(raw_fname) or "patch.pak"
+            app_patch_dir = os.path.join(PATCHES_DIR, appid)
+            os.makedirs(app_patch_dir, exist_ok=True)
+            # Clear old files in this appid patch folder if different filename
+            for existing_fn in os.listdir(app_patch_dir):
+                existing_fp = os.path.join(app_patch_dir, existing_fn)
+                if os.path.isfile(existing_fp) and existing_fn != safe_fname:
+                    try:
+                        os.remove(existing_fp)
+                    except Exception:
+                        pass
+            tmp_fp = os.path.join(app_patch_dir, safe_fname + ".tmp")
+            final_fp = os.path.join(app_patch_dir, safe_fname)
+            remaining = length
+            h = hashlib.sha256()
+            with open(tmp_fp, "wb") as out_f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+                    h.update(chunk)
+                    remaining -= len(chunk)
+            os.replace(tmp_fp, final_fp)
+            sha_hex = h.hexdigest()
+            self.send_json({
+                "ok": True,
+                "appid": appid,
+                "filename": safe_fname,
+                "size_bytes": os.path.getsize(final_fp),
+                "sha256": sha_hex,
+                "message": f"Patch '{safe_fname}' untuk AppID {appid} berhasil di-upload ke Server!"
+            })
+            return
+
         # /api/saves/<appid>/upload
         if len(parts) == 5 and parts[1] == "api" and parts[2] == "saves" and parts[4] == "upload":
             username = self.authenticate_user()

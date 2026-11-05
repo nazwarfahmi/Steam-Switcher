@@ -82,11 +82,13 @@
     }
 
     .brand {
-      padding: 18px 20px;
+      height: 64px;
+      padding: 0 20px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       gap: 11px;
+      flex-shrink: 0;
     }
 
     .brand-icon {
@@ -115,7 +117,8 @@
     }
 
     .sidebar-section-title {
-      padding: 16px 18px 8px;
+      height: 44px;
+      padding: 0 18px;
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
@@ -124,12 +127,13 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-shrink: 0;
     }
 
     .account-list {
       flex: 1;
       overflow-y: auto;
-      padding: 4px 12px 16px;
+      padding: 0 12px 16px;
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -226,13 +230,15 @@
     }
 
     .topbar {
-      padding: 14px 22px;
+      height: 64px;
+      padding: 0 22px;
       background: var(--bg-sidebar);
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 14px;
+      flex-shrink: 0;
     }
 
     .search-wrap {
@@ -294,10 +300,12 @@
     }
 
     .grid-header {
-      padding: 16px 22px 6px;
+      height: 44px;
+      padding: 0 22px;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-shrink: 0;
     }
 
     .grid-title {
@@ -310,14 +318,14 @@
     .games-scroll-area {
       flex: 1;
       overflow-y: auto;
-      padding: 12px 22px 32px;
+      padding: 0 22px 32px;
     }
 
     .games-container {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
       grid-auto-rows: max-content;
-      gap: 18px;
+      gap: 16px;
       align-items: stretch;
     }
 
@@ -329,12 +337,12 @@
       border: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      min-height: 358px;
-      transition: box-shadow 0.15s ease, border-color 0.15s ease;
+      transition: transform 0.14s ease, box-shadow 0.15s ease, border-color 0.15s ease;
       cursor: pointer;
     }
 
     .game-card:hover {
+      transform: translateY(-2px);
       box-shadow: var(--glow);
       border-color: var(--glow-border);
     }
@@ -342,7 +350,7 @@
     .poster-wrap {
       position: relative;
       width: 100%;
-      height: 245px;
+      aspect-ratio: 2 / 3;
       flex-shrink: 0;
       background: var(--bg-base);
       overflow: hidden;
@@ -364,47 +372,82 @@
       position: absolute;
       top: 8px;
       left: 8px;
+      right: 8px;
       display: flex;
       flex-direction: column;
       align-items: flex-start;
       gap: 5px;
     }
 
-    .badge-status {
-      padding: 3px 8px;
-      border-radius: 5px;
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 0.3px;
-      text-transform: uppercase;
-      background: var(--bg-badge);
-      color: var(--text-main);
-      border: 1px solid var(--border);
-      backdrop-filter: blur(6px);
-    }
-
     .badge-profile {
-      padding: 3px 8px;
-      border-radius: 5px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3.5px 8px 3.5px 6px;
+      border-radius: 6px;
       font-size: 10.5px;
       font-weight: 600;
       background: var(--bg-badge);
       color: var(--text-main);
       border: 1px solid var(--border);
       backdrop-filter: blur(6px);
+      max-width: 100%;
     }
 
-    .badge-drive {
-      position: absolute;
-      top: 8px;
-      right: 8px;
-      padding: 3px 7px;
-      border-radius: 5px;
+    .badge-profile.patch-installed {
+      border-color: rgba(34, 197, 94, 0.65);
+      box-shadow: 0 2px 10px rgba(34, 197, 94, 0.18);
+    }
+
+    .badge-profile.patch-available {
+      border-color: rgba(56, 189, 248, 0.65);
+      box-shadow: 0 2px 10px rgba(56, 189, 248, 0.16);
+    }
+
+    .patch-status-icon {
+      width: 16px;
+      height: 16px;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       font-size: 10px;
-      font-weight: 600;
-      background: var(--bg-badge);
-      color: var(--text-main);
-      border: 1px solid var(--border);
+      font-weight: 800;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+
+    .patch-status-icon.installed {
+      background: rgba(34, 197, 94, 0.22);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, 0.55);
+    }
+
+    .patch-status-icon.available {
+      background: rgba(56, 189, 248, 0.22);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.55);
+    }
+
+    .patch-status-icon.none {
+      background: rgba(148, 163, 184, 0.15);
+      color: var(--text-muted);
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      opacity: 0.75;
+    }
+
+    .badge-patched-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-size: 9.5px;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+      background: rgba(22, 163, 74, 0.88);
+      color: #ffffff;
+      border: 1px solid rgba(74, 222, 128, 0.65);
       backdrop-filter: blur(6px);
     }
 
@@ -412,9 +455,198 @@
       padding: 10px 11px 11px;
       display: flex;
       flex-direction: column;
-      gap: 9px;
+      gap: 6px;
       flex: 1;
       justify-content: space-between;
+    }
+
+    .card-sub-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 10.5px;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    /* STEAM-LIKE GAME DETAIL PAGE */
+    .game-detail-view {
+      display: none;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+      padding: 12px 22px 18px;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .game-detail-view.active {
+      display: flex;
+    }
+
+    .detail-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .btn-back-library {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 13px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-main);
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+
+    .btn-back-library:hover {
+      box-shadow: var(--glow);
+      border-color: var(--glow-border);
+    }
+
+    .detail-layout {
+      display: grid;
+      grid-template-columns: 310px minmax(0, 1fr);
+      gap: 16px;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    @media (max-width: 860px) {
+      .game-detail-view {
+        overflow-y: auto;
+      }
+      .detail-layout {
+        grid-template-columns: 1fr;
+        overflow: visible;
+      }
+    }
+
+    .detail-left-col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    .detail-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 14px 15px;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      flex-shrink: 0;
+    }
+
+    .detail-hero-top {
+      display: flex;
+      gap: 13px;
+      align-items: center;
+    }
+
+    .detail-poster {
+      width: 78px;
+      height: 116px;
+      border-radius: 8px;
+      object-fit: cover;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+    }
+
+    .detail-hero-info {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .detail-game-title {
+      font-size: 15.5px;
+      font-weight: 700;
+      color: var(--text-main);
+      line-height: 1.28;
+      word-break: break-word;
+    }
+
+    .detail-meta-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    .detail-section-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .detail-right-col {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .ach-nav-tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .ach-nav-tab {
+      padding: 7px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.12s ease;
+    }
+
+    .ach-nav-tab:hover {
+      color: var(--text-main);
+      border-color: var(--glow-border);
+    }
+
+    .ach-nav-tab.active {
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-text);
+      border-color: var(--btn-primary-bg);
     }
 
     .game-title {
@@ -516,22 +748,57 @@
     }
 
     .btn-history-icon {
-      padding: 7px 9px;
+      padding: 7px 8px;
       border-radius: 7px;
       border: 1px solid var(--border);
       background: var(--bg-base);
       color: var(--text-muted);
-      font-size: 13px;
+      font-size: 12.5px;
       font-weight: 600;
       cursor: pointer;
       flex-shrink: 0;
-      transition: box-shadow 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
     }
 
     .btn-history-icon:hover {
       color: var(--text-main);
       box-shadow: var(--glow);
       border-color: var(--glow-border);
+    }
+
+    .btn-history-icon.patch-btn-installed {
+      border-color: rgba(34, 197, 94, 0.55);
+      background: rgba(34, 197, 94, 0.12);
+      color: #4ade80;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    [data-theme="light"] .btn-history-icon.patch-btn-installed {
+      color: #15803d;
+      border-color: rgba(22, 163, 74, 0.45);
+    }
+
+    .btn-history-icon.patch-btn-available {
+      border-color: rgba(56, 189, 248, 0.55);
+      background: rgba(56, 189, 248, 0.12);
+      color: #38bdf8;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    [data-theme="light"] .btn-history-icon.patch-btn-available {
+      color: #0284c7;
+      border-color: rgba(2, 132, 199, 0.45);
+    }
+
+    .btn-history-icon.patch-btn-none {
+      opacity: 0.45;
+      font-size: 11px;
     }
 
     .local-save-banner {
@@ -696,10 +963,11 @@
       display: flex;
       flex-direction: column;
       gap: 8px;
-      max-height: 410px;
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
-      padding-right: 4px;
-      margin: 6px 0 12px;
+      padding-right: 6px;
+      margin: 2px 0 0;
     }
 
     .ach-item {
@@ -711,6 +979,7 @@
       border-radius: 9px;
       border: 1px solid var(--border);
       background: var(--bg-input);
+      flex-shrink: 0;
     }
 
     .ach-item.is-unlocked {
@@ -980,12 +1249,73 @@
       </div>
     </header>
 
-    <div class="grid-header">
+    <div class="grid-header" id="gridHeaderBar">
       <div class="grid-title" id="currentViewTitle">Daftar Game (Semua Akun)</div>
     </div>
 
-    <div class="games-scroll-area">
+    <div class="games-scroll-area" id="gamesScrollArea">
       <div class="games-container" id="gamesGrid"></div>
+    </div>
+
+    <!-- STEAM-STYLE GAME DETAIL PAGE -->
+    <div class="game-detail-view" id="gameDetailView">
+      <div class="detail-topbar">
+        <button class="btn-back-library" onclick="closeGamePage()">
+          <span>←</span>
+          <span>Kembali ke Daftar Game</span>
+        </button>
+      </div>
+
+      <div class="detail-layout">
+        <!-- LEFT COLUMN: PLAY, CLOUD SAVE, & PATCH BAHASA INDONESIA -->
+        <div class="detail-left-col">
+          <div class="detail-card" id="detailMainCard"></div>
+          <div class="detail-card" id="detailPatchCard"></div>
+        </div>
+
+        <!-- RIGHT COLUMN: ACHIEVEMENT LIST WITH NAV TABS -->
+        <div class="detail-right-col">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+            <div>
+              <h2 style="font-size:15px;font-weight:700;margin-bottom:2px;" id="achModalTitle">🏆 Achievement Save Saya</h2>
+              <div style="font-size:11px;color:var(--text-muted);">
+                Terdeteksi real-time saat bermain (popup otomatis) & tersinkron ke Cloud Anda.
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+              <button class="btn-mini" title="Coba tampilkan popup notifikasi achievement di pojok kanan bawah layar" onclick="bulkAchievementAction('test_popup')">🔔 Tes Popup</button>
+              <button class="btn-mini" title="Sinkronkan achievement save ini dengan Server Cloud" onclick="bulkAchievementAction('sync_cloud')">☁ Sinkron Cloud</button>
+              <button class="btn-mini" title="Reset semua achievement save Anda ke 0" onclick="askResetAchievements(true)">Reset ke 0</button>
+            </div>
+          </div>
+
+          <div class="ach-summary-bar" style="margin:2px 0;">
+            <div class="ach-summary-top">
+              <span id="achProgressLabel">Terbuka: 0 / 0 Achievement</span>
+              <span id="achPercentLabel" style="color:#4ade80;">0%</span>
+            </div>
+            <div class="ach-progress-track">
+              <div class="ach-progress-fill" id="achProgressBar" style="width:0%;"></div>
+            </div>
+          </div>
+
+          <div id="achResetConfirmBar" style="display:none;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;border-radius:10px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);font-size:12px;">
+            <span style="color:var(--text-main);font-weight:600;">⚠️ Yakin ingin mereset semua achievement save ini ke 0?</span>
+            <div style="display:flex;gap:6px;flex-shrink:0;">
+              <button class="btn-mini" style="background:#ef4444;color:#fff;border-color:#ef4444;" onclick="confirmResetAchievements()">Ya, Reset</button>
+              <button class="btn-mini" onclick="askResetAchievements(false)">Batal</button>
+            </div>
+          </div>
+
+          <div class="ach-nav-tabs">
+            <button class="ach-nav-tab active" id="achFilterLocked" onclick="setAchFilter('locked')">Belum Selesai (0)</button>
+            <button class="ach-nav-tab" id="achFilterUnlocked" onclick="setAchFilter('unlocked')">Sudah Selesai (0)</button>
+            <button class="ach-nav-tab" id="achFilterAll" onclick="setAchFilter('all')">Semua (0)</button>
+          </div>
+
+          <div class="ach-list" id="achListBox"></div>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -1059,48 +1389,6 @@
       <div class="history-list" id="historyListBox"></div>
       <div class="modal-footer" style="justify-content:flex-end;">
         <button class="icon-btn" onclick="closeHistoryModal()">Tutup</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- PERSONAL ACHIEVEMENT MODAL (KHUSUS SAVE SAYA) -->
-  <div class="modal-backdrop" id="achievementModal" onclick="if(event.target===this)closeAchievementModal()">
-    <div class="modal-box" style="width:620px;max-width:95vw;padding:22px 24px;">
-      <h2 id="achModalTitle">🏆 Achievement Save Saya</h2>
-      <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:6px;">
-        Terdeteksi otomatis secara real-time saat bermain (muncul popup seperti Steam) & otomatis tersinkron ke akun Cloud Anda.
-      </div>
-      <div class="ach-summary-bar">
-        <div class="ach-summary-top">
-          <span id="achProgressLabel">Terbuka: 0 / 0 Achievement</span>
-          <span id="achPercentLabel" style="color:#4ade80;">0%</span>
-        </div>
-        <div class="ach-progress-track">
-          <div class="ach-progress-fill" id="achProgressBar" style="width:0%;"></div>
-        </div>
-      </div>
-      <div class="ach-toolbar">
-        <div class="ach-filter-group">
-          <button class="ach-filter-btn active" id="achFilterAll" onclick="setAchFilter('all')">Semua</button>
-          <button class="ach-filter-btn" id="achFilterUnlocked" onclick="setAchFilter('unlocked')">Terbuka</button>
-          <button class="ach-filter-btn" id="achFilterLocked" onclick="setAchFilter('locked')">Terkunci</button>
-        </div>
-        <div style="display:flex;gap:6px;">
-          <button class="btn-mini" title="Coba tampilkan popup notifikasi achievement di pojok kanan bawah layar" onclick="bulkAchievementAction('test_popup')">🔔 Tes Popup</button>
-          <button class="btn-mini" title="Sinkronkan achievement save ini dengan Server Cloud (agar sinkron antar PC)" onclick="bulkAchievementAction('sync_cloud')">☁ Sinkron Cloud</button>
-          <button class="btn-mini" title="Reset semua achievement save Anda ke 0 (Mulai Bersih)" onclick="askResetAchievements(true)">Reset ke 0</button>
-        </div>
-      </div>
-      <div id="achResetConfirmBar" style="display:none;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;border-radius:10px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);font-size:12px;">
-        <span style="color:var(--text-main);font-weight:600;">⚠️ Yakin ingin mereset semua achievement save ini ke 0?</span>
-        <div style="display:flex;gap:6px;flex-shrink:0;">
-          <button class="btn-mini" style="background:#ef4444;color:#fff;border-color:#ef4444;" onclick="confirmResetAchievements()">Ya, Reset</button>
-          <button class="btn-mini" onclick="askResetAchievements(false)">Batal</button>
-        </div>
-      </div>
-      <div class="ach-list" id="achListBox"></div>
-      <div class="modal-footer" style="justify-content:flex-end;">
-        <button class="icon-btn" onclick="closeAchievementModal()">Tutup</button>
       </div>
     </div>
   </div>
@@ -1291,25 +1579,13 @@
         const isSel = selectedAccount === acc.account_name;
         const isCurrent = acc.is_active;
         html += `
-          <div class="account-item ${isSel ? 'selected' : ''}" onmousedown="handleAccountCardMouseDown(event, '${acc.account_name}')" onclick="handleAccountCardMouseDown(event, '${acc.account_name}')">
+          <div class="account-item ${isSel ? 'selected' : ''}" onmousedown="selectAccount('${acc.account_name}')" onclick="selectAccount('${acc.account_name}')">
             <div class="acc-top">
               <div class="acc-name">
                 ${isCurrent ? '<span class="active-dot" title="Akun Aktif"></span>' : ''}
                 <span>${acc.account_name}</span>
               </div>
               <span class="acc-count-pill">${acc.installed_count} / ${acc.total_count}</span>
-            </div>
-            <div class="acc-actions">
-              <button class="btn-mini" onmousedown="event.stopPropagation()" onclick="event.stopPropagation(); switchAccountOnly('${acc.account_name}')">
-                Buka Steam
-              </button>
-              <button
-                class="btn-mini"
-                onmousedown="event.stopPropagation()"
-                onclick="event.stopPropagation(); toggleOfflineMode('${acc.account_name}', ${!acc.offline_mode})"
-              >
-                ${acc.offline_mode ? 'Offline' : 'Online'}
-              </button>
             </div>
           </div>
         `;
@@ -1324,9 +1600,11 @@
     }
 
     function selectAccount(accName) {
-      if (selectedAccount === accName) return;
       selectedAccount = accName;
       localStorage.setItem("steam_switcher_selected_account", accName);
+      if (activeGamePageAppId) {
+        closeGamePage();
+      }
       renderSidebar();
       renderGames();
       saveWindowBounds();
@@ -1334,6 +1612,9 @@
 
     function renderGames() {
       const q = document.getElementById("searchInput").value.trim().toLowerCase();
+      if (q && activeGamePageAppId) {
+        closeGamePage();
+      }
       const titleEl = document.getElementById("currentViewTitle");
 
       if (selectedAccount === "ALL") {
@@ -1367,21 +1648,29 @@
         const isRun = Boolean(g.running);
         const isUp = Boolean(g.uploading);
         const stateClass = g.installed ? "installed" : "uninstalled";
-        const statusText = isRun
-          ? "Running"
-          : (isUp ? "Upload to Cloud" : (g.installed ? "Terinstal" : "Belum Terinstal"));
-        const driveHtml = (g.installed && g.drive)
-          ? `<span class="badge-drive">${g.drive} ${g.size_gb ? '• ' + g.size_gb + ' GB' : ''}</span>`
-          : "";
-        const btnContent = isRun
-          ? `<span class="running-dot"></span><span>Running</span>`
-          : (isUp
-              ? `<span class="running-dot"></span><span>Upload to Cloud</span>`
-              : (g.installed ? "Main" : "Install"));
-        const safeName = g.name.replace(/'/g, "\\'");
+
+        const pStatus = g.patch_status || "none";
+        let patchIconHtml = "";
+        let profilePatchClass = "";
+        let patchedTagHtml = "";
+
+        if (pStatus === "installed") {
+          patchIconHtml = `<span class="patch-status-icon installed" title="Sudah di-Patch Bahasa Indonesia">✓</span>`;
+          profilePatchClass = "patch-installed";
+          patchedTagHtml = `<span class="badge-patched-pill" title="Game ini sudah menggunakan Patch Bahasa Indonesia">🇮🇩 PATCH INDO</span>`;
+        } else if (pStatus === "available") {
+          patchIconHtml = `<span class="patch-status-icon available" title="Patch Bahasa Indonesia Tersedia">⬇</span>`;
+          profilePatchClass = "patch-available";
+        } else {
+          patchIconHtml = `<span class="patch-status-icon none" title="Patch Bahasa Indonesia Tidak Tersedia">–</span>`;
+        }
+
+        const runPillHtml = isRun
+          ? `<span class="badge-patched-pill" style="background:rgba(37,99,235,0.92);border-color:#60a5fa;"><span class="running-dot"></span> RUNNING</span>`
+          : (isUp ? `<span class="badge-patched-pill" style="background:rgba(2,132,199,0.92);border-color:#38bdf8;"><span class="running-dot"></span> CLOUD SYNC</span>` : "");
 
         return `
-          <div class="game-card ${stateClass}" data-appid="${g.appid}" onclick="launchGame('${g.appid}', '${g.owner_account}', ${!g.installed}, '${safeName}')">
+          <div class="game-card ${stateClass}" data-appid="${g.appid}" onclick="openGamePage('${g.appid}')">
             <div class="poster-wrap">
               <img
                 class="poster-img"
@@ -1391,45 +1680,28 @@
                 alt="${g.name}"
               />
               <div class="badges-top-left">
-                <span class="badge-status ${isRun ? 'is-running' : (isUp ? 'is-uploading' : '')}" id="badge-status-${g.appid}">${statusText}</span>
-                <span class="badge-profile">${g.owner_account}</span>
+                <span class="badge-profile ${profilePatchClass}">
+                  ${patchIconHtml}
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${g.owner_account}</span>
+                </span>
+                ${patchedTagHtml}
+                ${runPillHtml}
               </div>
-              ${driveHtml}
             </div>
             <div class="card-info">
               <div class="game-title" title="${g.name}">${g.name}</div>
-              <div style="display:flex;flex-direction:column;gap:7px;">
-                <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
-                  <label class="cloud-check-row" onmousedown="event.stopPropagation()" onclick="event.stopPropagation()">
-                    <input
-                      type="checkbox"
-                      ${g.cloud_enabled ? 'checked' : ''}
-                      onchange="toggleGameCloud('${g.appid}', this.checked, '${safeName}')"
-                    />
-                    <span>Cloud Save</span>
-                  </label>
-                  ${g.ach_total > 0 ? `<span style="font-size:10.5px;font-weight:700;color:${g.ach_unlocked > 0 ? '#4ade80' : 'var(--text-muted)'};" title="Achievement Save Saya">🏆 ${g.ach_unlocked}/${g.ach_total}</span>` : ''}
-                </div>
-                <div class="card-btn-row">
-                  <button class="btn-play-main ${isRun ? 'is-running' : (isUp ? 'is-uploading' : '')}" id="btn-play-${g.appid}">${btnContent}</button>
-                  <button
-                    class="btn-history-icon"
-                    title="Achievement Save Saya"
-                    onmousedown="event.stopPropagation()"
-                    onclick="event.stopPropagation(); openAchievementModal('${g.appid}', '${g.owner_account}', '${safeName}')"
-                  >🏆</button>
-                  <button
-                    class="btn-history-icon"
-                    title="Riwayat Cloud Save (Maks 5)"
-                    onmousedown="event.stopPropagation()"
-                    onclick="event.stopPropagation(); openHistoryModal('${g.appid}', '${g.owner_account}', '${safeName}')"
-                  >☁</button>
-                </div>
+              <div class="card-sub-meta">
+                <span>${g.cloud_enabled ? '☁ Cloud Aktif' : ''}</span>
+                ${g.ach_total > 0 ? `<span style="color:${g.ach_unlocked > 0 ? '#4ade80' : 'var(--text-muted)'};">🏆 ${g.ach_unlocked}/${g.ach_total}</span>` : ''}
               </div>
             </div>
           </div>
         `;
       }).join("");
+
+      if (activeGamePageAppId) {
+        renderGameDetailLeftColumn(activeGamePageAppId);
+      }
     }
 
     async function toggleGameCloud(appid, enabled, gameName) {
@@ -1457,10 +1729,264 @@
     let pendingConflict = null;
     let activeHistoryContext = null;
     let activeAchContext = null;
+    let activePatchContext = null;
+    let activeGamePageAppId = null;
     let currentAchList = [];
-    let currentAchFilter = "all";
+    let currentAchFilter = "locked";
     const shownUploadTs = {};
     const shownAchTs = {};
+
+    async function openGamePage(appid) {
+      const aid = String(appid);
+      activeGamePageAppId = aid;
+      const gObj = appState.games.find(x => String(x.appid) === aid) || { appid: aid, name: `App ${aid}` };
+      const targetAccount = (selectedAccount !== "ALL") ? selectedAccount : (gObj.owner_account || "");
+      const gameName = gObj.name || `App ${aid}`;
+
+      activeAchContext = { appid: aid, account: targetAccount, gameName };
+      activePatchContext = { appid: aid, gameName };
+      askResetAchievements(false);
+
+      document.getElementById("gridHeaderBar").style.display = "none";
+      document.getElementById("gamesScrollArea").style.display = "none";
+      document.getElementById("gameDetailView").classList.add("active");
+
+      try {
+        renderGameDetailLeftColumn(aid);
+      } catch (err) {
+        console.error("renderGameDetailLeftColumn error:", err);
+      }
+
+      const titleEl = document.getElementById("achModalTitle");
+      if (titleEl) titleEl.textContent = `🏆 Achievement: ${gameName}`;
+      const box = document.getElementById("achListBox");
+      if (box) {
+        box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">Memuat daftar achievement dari Steam...</div>`;
+      }
+
+      // Fetch achievements & patch info in parallel
+      fetch("/api/achievements", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ appid: aid, account: targetAccount })
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (activeGamePageAppId === aid) {
+            applyAchievementModalData(data);
+          }
+        })
+        .catch(() => {
+          if (activeGamePageAppId === aid && box) {
+            box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">Gagal memuat daftar achievement.</div>`;
+          }
+        });
+
+      fetch("/api/game_patch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ appid: aid, game_name: gameName, action: "info" })
+      })
+        .then(r => r.json())
+        .then(data => {
+          if (data && data.ok) {
+            const curG = appState.games.find(x => String(x.appid) === aid);
+            if (curG) Object.assign(curG, data);
+            if (activeGamePageAppId === aid) {
+              renderGameDetailLeftColumn(aid);
+            }
+          }
+        })
+        .catch(() => {});
+    }
+
+    function closeGamePage() {
+      activeGamePageAppId = null;
+      askResetAchievements(false);
+      const dv = document.getElementById("gameDetailView");
+      if (dv) dv.classList.remove("active");
+      const gh = document.getElementById("gridHeaderBar");
+      if (gh) gh.style.display = "";
+      const gs = document.getElementById("gamesScrollArea");
+      if (gs) gs.style.display = "";
+      renderGames();
+    }
+
+    function renderGameDetailLeftColumn(appid) {
+      const aid = String(appid);
+      const g = appState.games.find(x => String(x.appid) === aid);
+      const mainCard = document.getElementById("detailMainCard");
+      const patchCard = document.getElementById("detailPatchCard");
+      if (!g || !mainCard || !patchCard) return;
+
+      const targetAccount = (selectedAccount !== "ALL") ? selectedAccount : (g.owner_account || "");
+      const accObj = (appState.accounts || []).find(a => a.account_name === targetAccount) || {};
+      const isOfflineMode = Boolean(accObj.offline_mode);
+      const offlineChecked = isOfflineMode ? "checked" : "";
+      const safeName = (g.name || "").replace(/'/g, "\\'");
+      const isInstalled = g.installed !== false;
+      const isRunning = Boolean(g.running);
+      const isUploading = Boolean(g.uploading);
+      const cloudChecked = g.cloud_enabled ? "checked" : "";
+      const posterPrimary = g.cover_src || (`/api/cover/${g.appid}`);
+      const posterFallback = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.appid}/header.jpg`;
+      const driveInfo = isInstalled
+        ? `${g.drive || "-"} • ${g.size_gb ? g.size_gb + " GB" : "Terinstal"}`
+        : "Belum Terinstal di PC ini";
+
+      let playBtnClass = isRunning ? "is-running" : (isUploading ? "is-uploading" : "");
+      let playBtnContent = isRunning
+        ? `<span class="running-dot"></span><span>Sedang Berjalan</span>`
+        : (isUploading
+          ? `<span class="running-dot"></span><span>Upload Save...</span>`
+          : (isInstalled ? `▶ Mainkan Sekarang` : `⬇ Install via Steam`));
+
+      const steamSvgIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.979 0C5.678 0 .511 4.86.022 11.037l6.432 2.658c.545-.371 1.203-.59 1.912-.59.063 0 .125.004.188.006l2.861-4.142V8.91c0-2.495 2.028-4.524 4.524-4.524 2.494 0 4.524 2.031 4.524 4.527s-2.03 4.525-4.524 4.525h-.105l-4.076 2.911c0 .052.004.105.004.159 0 1.875-1.515 3.396-3.39 3.396-1.635 0-3.016-1.173-3.331-2.727L.436 15.27C1.862 20.307 6.486 24 11.979 24c6.627 0 11.999-5.373 11.999-12S18.605 0 11.979 0zM7.54 18.21l-1.473-.61c.262.543.714.999 1.314 1.25 1.297.539 2.793-.076 3.332-1.375.263-.63.264-1.319.005-1.949s-.75-1.121-1.377-1.383c-.624-.26-1.29-.249-1.878-.03l1.523.63c.956.4 1.409 1.5 1.009 2.455-.397.957-1.497 1.41-2.455 1.012zm11.415-9.303c0-1.662-1.353-3.015-3.015-3.015-1.665 0-3.015 1.353-3.015 3.015 0 1.665 1.35 3.015 3.015 3.015 1.663 0 3.015-1.35 3.015-3.015zm-5.273-.005c0-1.252 1.013-2.266 2.265-2.266 1.249 0 2.266 1.014 2.266 2.266 0 1.251-1.017 2.265-2.266 2.265-1.252 0-2.265-1.014-2.265-2.265z"/></svg>`;
+
+      mainCard.innerHTML = `
+        <div class="detail-hero-top">
+          <img
+            class="detail-poster"
+            src="${posterPrimary}"
+            alt="${g.name}"
+            onerror="this.onerror=null; this.src='${posterFallback}';"
+          />
+          <div class="detail-hero-info">
+            <div class="detail-game-title">${g.name}</div>
+            <div class="detail-meta-list">
+              <div>👤 Akun: <strong style="color:var(--text-main);">${targetAccount || "-"}</strong></div>
+              <div>💾 Status: <strong style="color:var(--text-main);">${driveInfo}</strong></div>
+              <div>🆔 AppID: <strong style="color:var(--text-main);">${g.appid}</strong></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:stretch;gap:8px;">
+          <button
+            id="btn-detail-play-${g.appid}"
+            class="btn-play-main ${playBtnClass}"
+            style="flex:1;padding:11px 14px;font-size:13.5px;border-radius:9px;"
+            onclick="launchGame('${g.appid}', '${targetAccount}', ${!isInstalled}, '${safeName}')"
+          >${playBtnContent}</button>
+          <button
+            class="icon-btn"
+            style="padding:0 13px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;"
+            title="Buka Steam dengan akun ${targetAccount}"
+            onclick="switchAccountOnly('${targetAccount}')"
+          >${steamSvgIcon}</button>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:8px;padding-top:6px;border-top:1px solid var(--border);">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <label class="cloud-check-row" style="font-size:12.5px;">
+              <input
+                type="checkbox"
+                ${cloudChecked}
+                onchange="toggleGameCloud('${g.appid}', this.checked, '${safeName}')"
+              />
+              <span>Cloud Save</span>
+            </label>
+            <button
+              class="btn-mini"
+              style="padding:5px 9px;font-size:13px;line-height:1;"
+              title="Riwayat Cloud Save (Maks 5)"
+              onclick="openHistoryModal('${g.appid}', '${targetAccount}', '${safeName}')"
+            >☁</button>
+          </div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <label class="cloud-check-row" style="font-size:12.5px;">
+              <input
+                type="checkbox"
+                ${offlineChecked}
+                onchange="toggleOfflineMode('${targetAccount}', this.checked)"
+              />
+              <span>Main Mode Offline</span>
+            </label>
+            <span style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--border);background:var(--bg-base);color:${isOfflineMode ? 'var(--text-muted)' : '#22c55e'};">
+              ${isOfflineMode ? 'Offline' : 'Online'}
+            </span>
+          </div>
+        </div>
+      `;
+
+      const pStatus = g.patch_status || "none";
+      const hasUpdate = Boolean(g.patch_has_update);
+      const hasLocal = Boolean(g.patch_has_local);
+
+      const statusHtml = (pStatus === "installed")
+        ? `<div style="display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:#22c55e;user-select:none;">
+             <span style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:rgba(34,197,94,0.16);font-size:11px;">✓</span>
+             <span>Sudah di-Patch</span>
+           </div>`
+        : `<div style="display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:var(--text-muted);user-select:none;">
+             <span style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:rgba(239,68,68,0.14);color:#ef4444;font-size:11px;">✕</span>
+             <span>Belum di-Patch</span>
+           </div>`;
+
+      let btnsHtml = "";
+      if (pStatus === "available") {
+        btnsHtml += `
+          <button class="btn-play-main" style="width:100%;padding:8px 12px;" onclick="executePatchAction('install')">
+            Patch ke Bahasa Indo
+          </button>
+        `;
+      } else if (pStatus === "installed") {
+        if (hasUpdate) {
+          btnsHtml += `
+            <button class="btn-play-main" style="width:100%;padding:8px 12px;" onclick="executePatchAction('install')">
+              Update Patch
+            </button>
+          `;
+        }
+        btnsHtml += `
+          <button class="icon-btn" style="width:100%;padding:8px 12px;border-color:rgba(239,68,68,0.45);color:#ef4444;" onclick="executePatchAction('uninstall')">
+            Hapus Patch
+          </button>
+        `;
+      }
+      if (hasLocal) {
+        btnsHtml += `
+          <button class="icon-btn" style="width:100%;padding:8px 12px;" onclick="executePatchAction('upload_server')">
+            Upload Patch
+          </button>
+        `;
+      }
+
+      patchCard.innerHTML = `
+        <div style="font-size:13px;font-weight:700;color:var(--text-main);">Patch Bahasa</div>
+        ${statusHtml}
+        ${btnsHtml ? `<div style="display:flex;flex-direction:column;gap:7px;margin-top:2px;">${btnsHtml}</div>` : ''}
+      `;
+    }
+
+    async function executePatchAction(action) {
+      if (!activePatchContext) return;
+      const { appid, gameName } = activePatchContext;
+      if (action === "install") {
+        showToast(`Mengunduh & memasang Patch Bahasa Indonesia untuk ${gameName}...`, 15000);
+      } else if (action === "uninstall") {
+        showToast(`Mengembalikan file original ${gameName}...`, 8000);
+      } else if (action === "upload_server") {
+        showToast(`Meng-upload file patch ${gameName} ke Server Cloud...`, 20000);
+      }
+
+      try {
+        const res = await fetch("/api/game_patch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid, game_name: gameName, action })
+        });
+        const data = await res.json();
+        showToast(data.message || (data.ok ? "Berhasil!" : "Gagal memproses patch."), 4500);
+        await refreshState();
+        if (activeGamePageAppId === String(appid)) {
+          renderGameDetailLeftColumn(appid);
+        }
+      } catch (e) {
+        showToast("Gagal menghubungi server lokal.");
+      }
+    }
 
     function updateGameRunningDom(appid, isRunning, isUploading = false) {
       const gObj = appState.games.find(x => String(x.appid) === String(appid));
@@ -1468,31 +1994,8 @@
         gObj.running = isRunning;
         gObj.uploading = isUploading;
       }
-      const btn = document.getElementById(`btn-play-${appid}`);
-      const badge = document.getElementById(`badge-status-${appid}`);
-      if (btn) {
-        btn.classList.remove("is-running", "is-uploading");
-        if (isRunning) {
-          btn.classList.add("is-running");
-          btn.innerHTML = `<span class="running-dot"></span><span>Running</span>`;
-        } else if (isUploading) {
-          btn.classList.add("is-uploading");
-          btn.innerHTML = `<span class="running-dot"></span><span>Upload to Cloud</span>`;
-        } else {
-          btn.textContent = (gObj && !gObj.installed) ? "Install" : "Main";
-        }
-      }
-      if (badge) {
-        badge.classList.remove("is-running", "is-uploading");
-        if (isRunning) {
-          badge.classList.add("is-running");
-          badge.textContent = "Running";
-        } else if (isUploading) {
-          badge.classList.add("is-uploading");
-          badge.textContent = "Upload to Cloud";
-        } else {
-          badge.textContent = (gObj && !gObj.installed) ? "Belum Terinstal" : "Terinstal";
-        }
+      if (activeGamePageAppId === String(appid)) {
+        renderGameDetailLeftColumn(appid);
       }
     }
 
@@ -1540,6 +2043,18 @@
             const tList = (achInfo.titles || []).join(", ");
             showToast(`🏆 Achievement Terbuka (${g.name}): ${tList}`, 5000);
             needRefresh = true;
+            if (activeGamePageAppId === aid && activeAchContext) {
+              fetch("/api/achievements", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ appid: aid, account: activeAchContext.account })
+              })
+                .then(r => r.json())
+                .then(d => {
+                  if (activeGamePageAppId === aid) applyAchievementModalData(d);
+                })
+                .catch(() => {});
+            }
           }
         }
         if (needRefresh) {
@@ -1713,48 +2228,34 @@
       await bulkAchievementAction("reset_all");
     }
 
-    async function openAchievementModal(appid, account, gameName) {
-      activeAchContext = { appid, account, gameName };
-      askResetAchievements(false);
-      document.getElementById("achModalTitle").textContent = `🏆 Achievement: ${gameName}`;
-      const box = document.getElementById("achListBox");
-      box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">Memuat daftar achievement dari Steam...</div>`;
-      document.getElementById("achievementModal").classList.add("show");
-
-      try {
-        const res = await fetch("/api/achievements", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ appid, account })
-        });
-        const data = await res.json();
-        applyAchievementModalData(data);
-      } catch (e) {
-        box.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">Gagal memuat daftar achievement.</div>`;
-      }
-    }
-
-    function closeAchievementModal() {
-      askResetAchievements(false);
-      document.getElementById("achievementModal").classList.remove("show");
-    }
-
     function applyAchievementModalData(data) {
       currentAchList = (data && data.achievements) || [];
       const unlocked = Number(data && data.unlocked_count) || 0;
       const total = Number(data && data.total_count) || 0;
+      const locked = Math.max(0, total - unlocked);
       const pct = total > 0 ? Math.round((unlocked / total) * 100) : 0;
       document.getElementById("achProgressLabel").textContent = `Terbuka: ${unlocked} / ${total} Achievement`;
       document.getElementById("achPercentLabel").textContent = `${pct}%`;
       document.getElementById("achProgressBar").style.width = `${pct}%`;
+
+      const tabLocked = document.getElementById("achFilterLocked");
+      const tabUnlocked = document.getElementById("achFilterUnlocked");
+      const tabAll = document.getElementById("achFilterAll");
+      if (tabLocked) tabLocked.textContent = `Belum Selesai (${locked})`;
+      if (tabUnlocked) tabUnlocked.textContent = `Sudah Selesai (${unlocked})`;
+      if (tabAll) tabAll.textContent = `Semua (${total})`;
+
       renderAchievementList();
     }
 
     function setAchFilter(filter) {
       currentAchFilter = filter;
-      document.getElementById("achFilterAll").classList.toggle("active", filter === "all");
-      document.getElementById("achFilterUnlocked").classList.toggle("active", filter === "unlocked");
-      document.getElementById("achFilterLocked").classList.toggle("active", filter === "locked");
+      const tabAll = document.getElementById("achFilterAll");
+      const tabUnlocked = document.getElementById("achFilterUnlocked");
+      const tabLocked = document.getElementById("achFilterLocked");
+      if (tabAll) tabAll.classList.toggle("active", filter === "all");
+      if (tabUnlocked) tabUnlocked.classList.toggle("active", filter === "unlocked");
+      if (tabLocked) tabLocked.classList.toggle("active", filter === "locked");
       renderAchievementList();
     }
 
@@ -1916,8 +2417,8 @@
     }
 
     async function switchAccountOnly(account) {
-      selectAccount(account);
-      showToast(`Mengganti akun Steam ke '${account}'...`, 4500);
+      if (!account) return;
+      showToast(`Membuka Steam dengan akun '${account}'...`, 4500);
       try {
         const res = await fetch("/api/switch_account", {
           method: "POST",
@@ -1934,6 +2435,10 @@
     }
 
     async function toggleOfflineMode(account, offline) {
+      if (!account) return;
+      const accObj = (appState.accounts || []).find(a => a.account_name === account);
+      if (accObj) accObj.offline_mode = Boolean(offline);
+      if (activeGamePageAppId) renderGameDetailLeftColumn(activeGamePageAppId);
       try {
         const res = await fetch("/api/toggle_offline", {
           method: "POST",
