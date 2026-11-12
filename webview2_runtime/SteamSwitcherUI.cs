@@ -116,6 +116,7 @@ namespace SteamSwitcherHost
         private OverlayForm overlayForm;
         private string baseUrl;
         private bool startHidden;
+        private bool isInitialized = false;
         private EventWaitHandle showEvent;
         public bool ForceExit = false;
 
@@ -159,6 +160,21 @@ namespace SteamSwitcherHost
             listenerThread.Start();
         }
 
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startHidden && value)
+            {
+                if (!this.IsHandleCreated)
+                {
+                    this.CreateHandle();
+                    this.BeginInvoke(new Action(EnsureInitializedAsync));
+                }
+                base.SetVisibleCore(false);
+                return;
+            }
+            base.SetVisibleCore(value);
+        }
+
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
@@ -181,6 +197,7 @@ namespace SteamSwitcherHost
                         if (ForceExit) break;
                         this.BeginInvoke(new Action(() =>
                         {
+                            this.startHidden = false;
                             this.Show();
                             if (this.WindowState == FormWindowState.Minimized)
                                 this.WindowState = FormWindowState.Normal;
@@ -193,25 +210,31 @@ namespace SteamSwitcherHost
             }
         }
 
-        private async void MainForm_Load(object sender, EventArgs e)
+        private async void EnsureInitializedAsync()
         {
-            if (startHidden)
+            if (isInitialized) return;
+            isInitialized = true;
+            try
             {
-                this.Hide();
+                string userDataDir = Path.Combine(Path.GetTempPath(), "SteamSwitcher_WebView2Profile");
+                var opts = new CoreWebView2EnvironmentOptions("--autoplay-policy=no-user-gesture-required --disable-features=Translate --disable-extensions --no-proxy-server");
+                var env = await CoreWebView2Environment.CreateAsync(null, userDataDir, opts);
+
+                await webView.EnsureCoreWebView2Async(env);
+                webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
+                webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+                webView.CoreWebView2.Navigate(baseUrl);
+
+                overlayForm = new OverlayForm();
+                overlayForm.Show();
+                await overlayForm.InitializeAsync(env, baseUrl);
             }
+            catch { }
+        }
 
-            string userDataDir = Path.Combine(Path.GetTempPath(), "SteamSwitcher_WebView2Profile");
-            var opts = new CoreWebView2EnvironmentOptions("--autoplay-policy=no-user-gesture-required --disable-features=Translate --disable-extensions --no-proxy-server");
-            var env = await CoreWebView2Environment.CreateAsync(null, userDataDir, opts);
-
-            await webView.EnsureCoreWebView2Async(env);
-            webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
-            webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
-            webView.CoreWebView2.Navigate(baseUrl);
-
-            overlayForm = new OverlayForm();
-            overlayForm.Show();
-            await overlayForm.InitializeAsync(env, baseUrl);
+        private void MainForm_Load(object sender, EventArgs e)
+        {
+            EnsureInitializedAsync();
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
@@ -263,15 +286,6 @@ namespace SteamSwitcherHost
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            bool createdNew;
-            EventWaitHandle showEvt = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\SteamSwitcher_WV2_ShowEvent", out createdNew);
-            if (!createdNew)
-            {
-                // Wake up existing WebView2 UI instance immediately
-                showEvt.Set();
-                return;
-            }
-
             string baseUrl = "http://127.0.0.1:18420";
             int w = 1280, h = 820;
             int? x = null, y = null;
@@ -285,6 +299,17 @@ namespace SteamSwitcherHost
                 else if (a.StartsWith("--win-x=")) { int vx; if (int.TryParse(a.Substring("--win-x=".Length), out vx)) x = vx; }
                 else if (a.StartsWith("--win-y=")) { int vy; if (int.TryParse(a.Substring("--win-y=".Length), out vy)) y = vy; }
                 else if (a == "--hidden") hidden = true;
+            }
+
+            bool createdNew;
+            EventWaitHandle showEvt = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\SteamSwitcher_WV2_ShowEvent", out createdNew);
+            if (!createdNew)
+            {
+                if (!hidden)
+                {
+                    showEvt.Set();
+                }
+                return;
             }
 
             MainForm mainForm = new MainForm(baseUrl, w, h, x, y, hidden, showEvt);

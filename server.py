@@ -2011,6 +2011,20 @@ def uninstall_game_patch(steam_path, appid, game_name):
         ext_orig = find_local_original_backup(aid_s, game_name, os.path.basename(target_fp))
         if ext_orig and os.path.exists(ext_orig):
             backup_fp = ext_orig
+        elif target_fp.lower().endswith("_p.pak") and os.path.exists(target_fp):
+            try:
+                os.remove(target_fp)
+            except Exception as e:
+                return False, f"Gagal menghapus file patch add-on: {e}"
+            patched_reg[aid_s] = {
+                "status": "unpatched",
+                "filename": os.path.basename(target_fp),
+                "target_path": target_fp,
+                "updated_at": int(time.time())
+            }
+            save_patched_games(patched_reg)
+            build_full_state()
+            return True, f"Patch Bahasa Indonesia untuk '{game_name}' berhasil dihapus."
         else:
             return False, "File backup original belum ditemukan, gunakan Verify Integrity di Steam untuk mengembalikan file asli."
 
@@ -3049,7 +3063,12 @@ def ensure_webview2_host():
             dst = os.path.join(WEBVIEW2_HOST_DIR, fn)
             if os.path.isfile(src):
                 try:
-                    if not os.path.exists(dst) or os.path.getsize(src) != os.path.getsize(dst):
+                    need_copy = (
+                        not os.path.exists(dst)
+                        or os.path.getsize(src) != os.path.getsize(dst)
+                        or int(os.path.getmtime(src)) != int(os.path.getmtime(dst))
+                    )
+                    if need_copy:
                         shutil.copy2(src, dst)
                 except Exception:
                     pass
