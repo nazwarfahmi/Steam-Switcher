@@ -14,6 +14,7 @@ import hashlib
 import winreg
 import fnmatch
 import tempfile
+import queue
 import threading
 import ctypes
 import urllib.parse
@@ -84,6 +85,11 @@ LOGO_B64_URI = (
     "data:image/png;base64," + base64.b64encode(LOGO_PNG_BYTES).decode("ascii")
     if LOGO_PNG_BYTES else "/logo.png"
 )
+SPEED_MOD_DLL_BYTES = _load_asset_bytes(os.path.join("speed_plugin", "ss_fastforward64.dll"))
+SPEED_CMD_QUEUE = queue.Queue()
+ACTIVE_FF_HOOKS = {}
+FF_HOOKS_LOCK = threading.Lock()
+CAPTURE_PAD_CANCEL = threading.Event()
 
 NON_GAME_APPIDS = {
     "228980",    # Steamworks Common Redistributables
@@ -366,6 +372,47 @@ def _unwrap_vdf_typed(obj):
         return {k: _unwrap_vdf_typed(v) for k, v in obj.items()}
     return obj
 
+def _sanitize_speed_target(val, default=2.0):
+    try:
+        f = round(float(val), 2)
+        if 0.2 <= f <= 20.0:
+            return f
+    except Exception:
+        pass
+    return default
+
+def _sanitize_kb_bind(raw):
+    if not isinstance(raw, dict):
+        return None
+    vks_raw = raw.get("vks")
+    label = str(raw.get("label") or "").strip()
+    if not isinstance(vks_raw, list) or not vks_raw or not label:
+        return None
+    vks = []
+    for x in vks_raw[:4]:
+        try:
+            iv = int(x)
+            if 1 <= iv <= 254:
+                vks.append(iv)
+        except Exception:
+            pass
+    return {"vks": vks, "label": label[:40]} if vks else None
+
+def _sanitize_pad_bind(raw):
+    if not isinstance(raw, dict):
+        return None
+    src = str(raw.get("source") or "xinput").strip().lower()
+    if src not in ("xinput", "joy"):
+        src = "xinput"
+    try:
+        mask = int(raw.get("mask") or 0)
+    except Exception:
+        mask = 0
+    label = str(raw.get("label") or "").strip()
+    if mask <= 0 or not label:
+        return None
+    return {"source": src, "mask": mask, "label": label[:40]}
+
 def load_local_games():
     data = _reg_read_json("LocalGames")
     if not isinstance(data, dict):
@@ -381,6 +428,10 @@ def load_local_games():
                 "install_dir": os.path.normpath(v["install_dir"]) if v.get("install_dir") else "",
                 "save_dir": os.path.normpath(v["save_dir"]) if v.get("save_dir") else "",
                 "emu_type": str(v.get("emu_type") or ""),
+                "speed_enabled": bool(v.get("speed_enabled", False)),
+                "speed_target": _sanitize_speed_target(v.get("speed_target", 2.0), 2.0),
+                "speed_kb_bind": _sanitize_kb_bind(v.get("speed_kb_bind")),
+                "speed_pad_bind": _sanitize_pad_bind(v.get("speed_pad_bind")),
                 "added_at": int(v.get("added_at") or 0),
                 "last_played": int(v.get("last_played") or 0),
             }
@@ -389,6 +440,677 @@ def load_local_games():
 def save_local_games(data):
     if isinstance(data, dict):
         _reg_write_json("LocalGames", data)
+
+WM_SS_APPLY_SPEED = 0x8000 + 0x535
+SS_WPARAM_MAGIC = 0x5357
+
+def _is_strictly_local_game(appid):
+    aid_s = str(appid).strip()
+    local_games = load_local_games()
+    if aid_s not in local_games:
+        return False
+    reg = get_steam_registry_info()
+    inst = get_installed_games(reg["steam_path"]).get(aid_s)
+    if inst and not inst.get("is_local"):
+        return False
+    return True
+
+def ensure_runtime_fastforward_dll():
+    """Ensure helper DLL exists in %LOCALAPPDATA%\\SteamSwitcher (NEVER inside any game folder)."""
+    dll_bytes = SPEED_MOD_DLL_BYTES or _load_asset_bytes(os.path.join("speed_plugin", "ss_fastforward64.dll"))
+    if not dll_bytes:
+        return ""
+    os.makedirs(LOCAL_DATA_ROOT, exist_ok=True)
+    dst_fp = os.path.join(LOCAL_DATA_ROOT, "ss_fastforward64.dll")
+    try:
+        need_write = (not os.path.isfile(dst_fp)) or (os.path.getsize(dst_fp) != len(dll_bytes))
+        if not need_write:
+            with open(dst_fp, "rb") as f:
+                if f.read() != dll_bytes:
+                    need_write = True
+        if need_write:
+            with open(dst_fp, "wb") as f:
+                f.write(dll_bytes)
+    except PermissionError:
+        # Already mapped in an active session
+        pass
+    except Exception:
+        pass
+    return dst_fp if os.path.isfile(dst_fp) else ""
+
+def get_local_game_running_pids(appid):
+    """Return list of exact running PIDs belonging to this Local Game's executable (path-verified, excluding crash handlers)."""
+    aid_s = str(appid).strip()
+    lg = load_local_games().get(aid_s)
+    if not lg:
+        return []
+    exe_path = os.path.normpath(lg.get("exe_path", "")).lower() if lg.get("exe_path") else ""
+    install_dir = os.path.normpath(lg.get("install_dir", "")).lower() if lg.get("install_dir") else ""
+    target_exe_name = os.path.basename(exe_path) if exe_path else ""
+
+    pids = []
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = ctypes.c_int
+        k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32NextW.restype = ctypes.c_int
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)]
+        k32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
+
+        h_snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid_h = ctypes.c_void_p(-1).value
+        if h_snap and h_snap != invalid_h:
+            try:
+                pe = _PROCESSENTRY32W()
+                pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+                if k32.Process32FirstW(h_snap, ctypes.byref(pe)):
+                    while True:
+                        fn_low = (pe.szExeFile or "").lower()
+                        pid_val = int(pe.th32ProcessID)
+                        if fn_low and fn_low.endswith(".exe") and not fn_low.startswith(_IGNORED_EXE_PREFIXES):
+                            cand_match = (target_exe_name and fn_low == target_exe_name) or (not target_exe_name and bool(install_dir))
+                            if cand_match or install_dir:
+                                hp = k32.OpenProcess(0x1000, 0, pid_val)  # PROCESS_QUERY_LIMITED_INFORMATION
+                                if hp:
+                                    try:
+                                        buf_len = ctypes.c_uint32(520)
+                                        pbuf = ctypes.create_unicode_buffer(520)
+                                        if k32.QueryFullProcessImageNameW(hp, 0, pbuf, ctypes.byref(buf_len)):
+                                            full_img = os.path.normpath(pbuf.value).lower()
+                                            if (exe_path and full_img == exe_path) or (install_dir and full_img.startswith(install_dir + os.sep)):
+                                                pids.append(pid_val)
+                                    finally:
+                                        k32.CloseHandle(hp)
+                                elif target_exe_name and fn_low == target_exe_name:
+                                    pids.append(pid_val)
+                        if not k32.Process32NextW(h_snap, ctypes.byref(pe)):
+                            break
+            finally:
+                k32.CloseHandle(h_snap)
+    except Exception:
+        pass
+    return pids
+
+def _find_game_window_and_tid(pids):
+    """Find the visible main game window (hwnd, thread_id, pid) for the given running PIDs."""
+    if not pids:
+        return None, 0, 0
+    pid_set = set(int(p) for p in pids)
+    best = [None, 0, 0, 0]  # [hwnd, tid, pid, priority]
+    try:
+        u32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
+        u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        u32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+        u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        u32.IsWindowVisible.restype = ctypes.c_int
+        u32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        u32.GetClassNameW.restype = ctypes.c_int
+        u32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        u32.GetWindow.restype = ctypes.c_void_p
+
+        def _cb(hwnd, _lp):
+            wpid = ctypes.c_uint32(0)
+            tid = u32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value in pid_set and tid and u32.IsWindowVisible(hwnd):
+                cbuf = ctypes.create_unicode_buffer(128)
+                u32.GetClassNameW(hwnd, cbuf, 127)
+                cls_name = cbuf.value or ""
+                if cls_name == "UnityWndClass":
+                    best[:] = [hwnd, int(tid), int(wpid.value), 2]
+                    return 0
+                if best[3] < 1 and not u32.GetWindow(hwnd, 4):  # GW_OWNER == 4
+                    best[:] = [hwnd, int(tid), int(wpid.value), 1]
+            return 1
+
+        cb_fn = WNDENUMPROC(_cb)
+        u32.EnumWindows(cb_fn, 0)
+    except Exception:
+        pass
+    return best[0], best[1], best[2]
+
+class _XINPUT_GAMEPAD(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_uint16),
+        ("bLeftTrigger", ctypes.c_uint8),
+        ("bRightTrigger", ctypes.c_uint8),
+        ("sThumbLX", ctypes.c_int16),
+        ("sThumbLY", ctypes.c_int16),
+        ("sThumbRX", ctypes.c_int16),
+        ("sThumbRY", ctypes.c_int16),
+    ]
+
+class _XINPUT_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwPacketNumber", ctypes.c_uint32),
+        ("Gamepad", _XINPUT_GAMEPAD),
+    ]
+
+class _JOYINFOEX(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32), ("dwFlags", ctypes.c_uint32),
+        ("dwXpos", ctypes.c_uint32), ("dwYpos", ctypes.c_uint32), ("dwZpos", ctypes.c_uint32),
+        ("dwRpos", ctypes.c_uint32), ("dwUpos", ctypes.c_uint32), ("dwVpos", ctypes.c_uint32),
+        ("dwButtons", ctypes.c_uint32), ("dwButtonNumber", ctypes.c_uint32),
+        ("dwPOV", ctypes.c_uint32), ("dwReserved1", ctypes.c_uint32), ("dwReserved2", ctypes.c_uint32),
+    ]
+
+_XINPUT_DLL = None
+_XINPUT_INIT_DONE = False
+_WINMM_DLL = None
+
+_XINPUT_BTN_NAMES = [
+    (0x0040, "L3"),
+    (0x0080, "R3"),
+    (0x0100, "L1 / LB"),
+    (0x0200, "R1 / RB"),
+    (0x10000, "L2 / LT"),
+    (0x20000, "R2 / RT"),
+    (0x0020, "Select / Back"),
+    (0x0010, "Start"),
+    (0x0400, "Guide"),
+    (0x1000, "A / ✕"),
+    (0x2000, "B / ○"),
+    (0x4000, "X / □"),
+    (0x8000, "Y / △"),
+    (0x0001, "D-Up"),
+    (0x0002, "D-Down"),
+    (0x0004, "D-Left"),
+    (0x0008, "D-Right"),
+]
+
+def _get_xinput_func():
+    global _XINPUT_DLL, _XINPUT_INIT_DONE
+    if not _XINPUT_INIT_DONE:
+        _XINPUT_INIT_DONE = True
+        for dname in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+            try:
+                dll = ctypes.WinDLL(dname)
+                # Try ordinal 100 (XInputGetStateEx) first to also support Guide button, else XInputGetState
+                try:
+                    fn = dll[100]
+                except Exception:
+                    fn = dll.XInputGetState
+                fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(_XINPUT_STATE)]
+                fn.restype = ctypes.c_uint32
+                _XINPUT_DLL = fn
+                break
+            except Exception:
+                pass
+    return _XINPUT_DLL
+
+def _read_gamepad_state():
+    """Return ('xinput'|'joy', combined_button_mask) across connected controllers."""
+    xi_fn = _get_xinput_func()
+    if xi_fn is not None:
+        any_xi_connected = False
+        xi_mask = 0
+        st = _XINPUT_STATE()
+        for idx in range(4):
+            try:
+                res = xi_fn(idx, ctypes.byref(st))
+                if res == 0:
+                    any_xi_connected = True
+                    m = int(st.Gamepad.wButtons)
+                    if st.Gamepad.bLeftTrigger > 165:
+                        m |= 0x10000
+                    if st.Gamepad.bRightTrigger > 165:
+                        m |= 0x20000
+                    xi_mask |= m
+            except Exception:
+                pass
+        if any_xi_connected:
+            return "xinput", xi_mask
+
+    global _WINMM_DLL
+    if _WINMM_DLL is None:
+        try:
+            _WINMM_DLL = ctypes.WinDLL("winmm.dll")
+            _WINMM_DLL.joyGetNumDevs.restype = ctypes.c_uint32
+            _WINMM_DLL.joyGetPosEx.argtypes = [ctypes.c_uint32, ctypes.POINTER(_JOYINFOEX)]
+            _WINMM_DLL.joyGetPosEx.restype = ctypes.c_uint32
+        except Exception:
+            _WINMM_DLL = False
+    if _WINMM_DLL:
+        try:
+            ndevs = min(int(_WINMM_DLL.joyGetNumDevs()), 4)
+            joy_mask = 0
+            ji = _JOYINFOEX()
+            ji.dwSize = ctypes.sizeof(_JOYINFOEX)
+            ji.dwFlags = 0x0080  # JOY_RETURNBUTTONS
+            for j in range(ndevs):
+                if _WINMM_DLL.joyGetPosEx(j, ctypes.byref(ji)) == 0:
+                    joy_mask |= int(ji.dwButtons)
+            return "joy", joy_mask
+        except Exception:
+            pass
+    return "xinput", 0
+
+def _format_pad_mask_label(source, mask):
+    parts = []
+    if source == "xinput":
+        for bit, name in _XINPUT_BTN_NAMES:
+            if mask & bit:
+                parts.append(name)
+    else:
+        for b in range(32):
+            if mask & (1 << b):
+                btn_no = b + 1
+                if btn_no == 11:
+                    parts.append("Btn 11 (L3)")
+                elif btn_no == 12:
+                    parts.append("Btn 12 (R3)")
+                else:
+                    parts.append(f"Stick Btn {btn_no}")
+    return " + ".join(parts) if parts else f"Btn 0x{mask:X}"
+
+def capture_gamepad_binding(timeout_sec=6.5):
+    """Wait for user to press a controller button (e.g. L3, R3, or L1+R3 combo) and return {'source', 'mask', 'label'}."""
+    CAPTURE_PAD_CANCEL.clear()
+    t_end = time.time() + float(timeout_sec)
+
+    # 1. Wait briefly for any currently held button to be released first
+    while time.time() < t_end and not CAPTURE_PAD_CANCEL.is_set():
+        _, init_m = _read_gamepad_state()
+        if init_m == 0:
+            break
+        time.sleep(0.03)
+
+    # 2. Wait for button press; accumulate peak mask for up to 350ms to allow 2-button combos (or finish immediately on release)
+    peak_mask = 0
+    detected_source = "xinput"
+    press_start = 0.0
+
+    while time.time() < t_end and not CAPTURE_PAD_CANCEL.is_set():
+        src, cur_m = _read_gamepad_state()
+        if cur_m != 0:
+            if peak_mask == 0:
+                press_start = time.time()
+                detected_source = src
+            peak_mask |= cur_m
+            if (time.time() - press_start) >= 0.35:
+                break
+        elif peak_mask != 0:
+            # User tapped and released cleanly (e.g. single tap L3 or R3)
+            break
+        time.sleep(0.025)
+
+    if CAPTURE_PAD_CANCEL.is_set():
+        return None, "Perekaman tombol stick dibatalkan."
+    if peak_mask == 0:
+        return None, "Tidak ada tombol stick yang terdeteksi. Pastikan stick terhubung lalu tekan tombolnya (misal L3 atau R3)."
+    label = _format_pad_mask_label(detected_source, peak_mask)
+    return {"source": detected_source, "mask": int(peak_mask), "label": label}, ""
+
+def get_local_game_speed_state(appid, is_running=None):
+    aid_s = str(appid).strip()
+    lg = load_local_games().get(aid_s)
+    if not lg:
+        return {
+            "speed_enabled": False,
+            "speed_target": 2.0,
+            "speed_current": 1.0,
+            "speed_active": False,
+            "speed_kb_bind": None,
+            "speed_pad_bind": None,
+            "speed_engine": ""
+        }
+    enabled = bool(lg.get("speed_enabled", False))
+    target_spd = _sanitize_speed_target(lg.get("speed_target", 2.0), 2.0)
+    kb_bind = _sanitize_kb_bind(lg.get("speed_kb_bind"))
+    pad_bind = _sanitize_pad_bind(lg.get("speed_pad_bind"))
+    if not enabled:
+        return {
+            "speed_enabled": False,
+            "speed_target": target_spd,
+            "speed_current": 1.0,
+            "speed_active": False,
+            "speed_kb_bind": kb_bind,
+            "speed_pad_bind": pad_bind,
+            "speed_engine": ""
+        }
+    if is_running is None:
+        is_running = is_local_game_running(aid_s)
+    cur_speed = 1.0
+    if is_running:
+        with FF_HOOKS_LOCK:
+            rec = ACTIVE_FF_HOOKS.get(aid_s)
+            if rec:
+                cur_speed = round(float(rec.get("speed", 1.0)), 2)
+    is_ff_on = bool(is_running and abs(cur_speed - 1.0) > 0.02)
+    return {
+        "speed_enabled": True,
+        "speed_target": target_spd,
+        "speed_current": cur_speed,
+        "speed_active": is_ff_on,
+        "speed_kb_bind": kb_bind,
+        "speed_pad_bind": pad_bind,
+        "speed_engine": "Runtime In-Memory"
+    }
+
+def enqueue_speed_popup(appid, game_name, speed_val, bind_hint=""):
+    is_on = abs(speed_val - 1.0) > 0.02
+    spd_txt = f"{speed_val:g}x"
+    title_txt = f"Fast-Forward ON ({spd_txt})" if is_on else "Fast-Forward OFF (1x Normal)"
+    desc_txt = f"{game_name}" + (f" • Toggle: {bind_hint}" if bind_hint else "")
+    with POPUP_LOCK:
+        ACHIEVEMENT_POPUP_QUEUE[:] = [p for p in ACHIEVEMENT_POPUP_QUEUE if p.get("kind") != "speed"]
+        ACHIEVEMENT_POPUP_QUEUE.append({
+            "id": f"speed:{appid}:{int(time.time()*1000)}",
+            "kind": "speed",
+            "appid": str(appid),
+            "game_name": game_name,
+            "title": title_txt,
+            "description": desc_txt,
+            "prog_label": spd_txt if is_on else "OFF",
+            "ts": int(time.time())
+        })
+
+def detach_local_speed_hook(appid, restore_normal=True):
+    """Queue clean detachment of runtime speed hook on the persistent hook owner thread."""
+    aid_s = str(appid).strip()
+    evt = threading.Event()
+    box = {}
+    SPEED_CMD_QUEUE.put(("detach", aid_s, 1.0 if restore_normal else 0.0, evt, box))
+    evt.wait(timeout=1.5)
+
+def detach_all_speed_hooks():
+    with FF_HOOKS_LOCK:
+        aids = list(ACTIVE_FF_HOOKS.keys())
+    for aid_s in aids:
+        detach_local_speed_hook(aid_s, restore_normal=True)
+
+def set_local_game_speed(appid, multiplier, show_overlay=False, bind_hint=""):
+    aid_s = str(appid).strip()
+    if not _is_strictly_local_game(aid_s):
+        return False, "Fitur fast-forward hanya tersedia untuk Game Lokal (Offline Single-Player)."
+    lg = load_local_games().get(aid_s)
+    if not lg or not lg.get("speed_enabled"):
+        return False, "Aktifkan fitur Fast-Forward pada game lokal ini terlebih dahulu."
+
+    spd = _sanitize_speed_target(multiplier, 1.0)
+
+    evt = threading.Event()
+    box = {}
+    SPEED_CMD_QUEUE.put(("set", aid_s, spd, evt, box))
+    evt.wait(timeout=2.5)
+
+    if not box.get("ok"):
+        return False, box.get("error") or "Gagal menghubungkan fast-forward ke jendela game yang sedang berjalan."
+
+    gtitle = lg.get("name") or f"App {aid_s}"
+    if show_overlay:
+        enqueue_speed_popup(aid_s, gtitle, spd, bind_hint=bind_hint)
+
+    st = get_local_game_speed_state(aid_s, is_running=True)
+    st["speed_current"] = spd
+    st["speed_active"] = abs(spd - 1.0) > 0.02
+    spd_disp = f"{spd:g}x"
+    return True, {
+        "message": f"⚡ Fast-Forward '{gtitle}' NYALA ({spd_disp})!" if st["speed_active"] else f"⚡ Fast-Forward '{gtitle}' MATI (1x Normal).",
+        **st
+    }
+
+def toggle_local_game_speed_now(appid, show_overlay=False, bind_hint=""):
+    aid_s = str(appid).strip()
+    lg = load_local_games().get(aid_s)
+    if not lg or not lg.get("speed_enabled"):
+        return False, "Fitur Fast-Forward belum diaktifkan untuk game ini."
+    st = get_local_game_speed_state(aid_s, is_running=True)
+    next_spd = 1.0 if st.get("speed_active") else _sanitize_speed_target(lg.get("speed_target", 2.0), 2.0)
+    if abs(next_spd - 1.0) <= 0.02 and not st.get("speed_active"):
+        return False, "Masukkan angka kecepatan selain 1x terlebih dahulu (misal 2 atau 3)."
+    return set_local_game_speed(aid_s, next_spd, show_overlay=show_overlay, bind_hint=bind_hint)
+
+def get_active_local_speeds_summary():
+    out = {}
+    local_games = load_local_games()
+    for aid_s, lg in local_games.items():
+        if not lg.get("speed_enabled"):
+            continue
+        if is_local_game_running(aid_s):
+            st = get_local_game_speed_state(aid_s, is_running=True)
+            out[aid_s] = {
+                "speed": st["speed_current"],
+                "active": st["speed_active"],
+                "target": st["speed_target"],
+                "engine": st["speed_engine"]
+            }
+    return out
+
+def local_speed_hotkey_loop():
+    """Persistent owner thread for Win32 runtime fast-forward hooks + in-game Alt+1..4 shortcuts (zero game files touched)."""
+    k32 = ctypes.windll.kernel32
+    u32 = ctypes.windll.user32
+
+    k32.LoadLibraryW.argtypes = [ctypes.c_wchar_p]
+    k32.LoadLibraryW.restype = ctypes.c_void_p
+    k32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    k32.GetProcAddress.restype = ctypes.c_void_p
+
+    u32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+    u32.SetWindowsHookExW.restype = ctypes.c_void_p
+    u32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    u32.UnhookWindowsHookEx.restype = ctypes.c_int
+    u32.SendMessageTimeoutW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_ssize_t,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_size_t)
+    ]
+    u32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+    u32.IsWindow.argtypes = [ctypes.c_void_p]
+    u32.IsWindow.restype = ctypes.c_int
+    u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    u32.GetAsyncKeyState.restype = ctypes.c_short
+    u32.GetForegroundWindow.argtypes = []
+    u32.GetForegroundWindow.restype = ctypes.c_void_p
+    u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    u32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+
+    h_ff_dll = None
+    fn_ff_proc = None
+
+    def _ensure_hook_loaded():
+        nonlocal h_ff_dll, fn_ff_proc
+        if h_ff_dll and fn_ff_proc:
+            return True
+        dll_fp = ensure_runtime_fastforward_dll()
+        if not dll_fp:
+            return False
+        h_ff_dll = k32.LoadLibraryW(dll_fp)
+        if not h_ff_dll:
+            return False
+        fn_ff_proc = k32.GetProcAddress(h_ff_dll, b"FastForwardHookProc")
+        return bool(fn_ff_proc)
+
+    def _apply_on_owner_thread(aid_s, spd):
+        pids = get_local_game_running_pids(aid_s)
+        if not pids:
+            return False, "Game sedang tidak berjalan."
+        hwnd, tid, target_pid = _find_game_window_and_tid(pids)
+        if not hwnd or not tid:
+            return False, "Jendela utama game belum siap, tunggu beberapa detik lalu coba lagi."
+
+        if not _ensure_hook_loaded():
+            return False, "Modul runtime fast-forward tidak dapat dimuat."
+
+        with FF_HOOKS_LOCK:
+            existing = ACTIVE_FF_HOOKS.get(aid_s)
+
+        # Clean up stale hook if window/thread changed (e.g. game restarted)
+        if existing and (existing.get("tid") != tid or not u32.IsWindow(existing.get("hwnd"))):
+            if existing.get("hhook"):
+                u32.UnhookWindowsHookEx(existing["hhook"])
+            with FF_HOOKS_LOCK:
+                ACTIVE_FF_HOOKS.pop(aid_s, None)
+            existing = None
+
+        if abs(spd - 1.0) <= 0.02:
+            if existing and existing.get("hhook"):
+                lres = ctypes.c_size_t(0)
+                u32.SendMessageTimeoutW(hwnd, WM_SS_APPLY_SPEED, SS_WPARAM_MAGIC, 1000, 0x0002, 500, ctypes.byref(lres))
+                u32.UnhookWindowsHookEx(existing["hhook"])
+            with FF_HOOKS_LOCK:
+                ACTIVE_FF_HOOKS.pop(aid_s, None)
+            return True, ""
+
+        hhook = existing["hhook"] if existing else None
+        if not hhook:
+            # WH_CALLWNDPROC == 4, scoped strictly to this single game window's thread ID
+            hhook = u32.SetWindowsHookExW(4, fn_ff_proc, h_ff_dll, int(tid))
+            if not hhook:
+                return False, "Gagal menempelkan pengatur kecepatan ke jendela game (coba jalankan aplikasi sebagai Administrator jika game berjalan elevated)."
+
+        milli = max(100, min(20000, int(round(spd * 1000.0))))
+        lres = ctypes.c_size_t(0)
+        u32.SendMessageTimeoutW(hwnd, WM_SS_APPLY_SPEED, SS_WPARAM_MAGIC, milli, 0x0002, 600, ctypes.byref(lres))
+        with FF_HOOKS_LOCK:
+            ACTIVE_FF_HOOKS[aid_s] = {
+                "pid": target_pid,
+                "tid": tid,
+                "hwnd": hwnd,
+                "hhook": hhook,
+                "speed": spd
+            }
+        return True, ""
+
+    def _detach_on_owner_thread(aid_s, restore_normal):
+        with FF_HOOKS_LOCK:
+            rec = ACTIVE_FF_HOOKS.pop(aid_s, None)
+        if rec and rec.get("hhook"):
+            if restore_normal and rec.get("hwnd") and u32.IsWindow(rec["hwnd"]):
+                lres = ctypes.c_size_t(0)
+                u32.SendMessageTimeoutW(rec["hwnd"], WM_SS_APPLY_SPEED, SS_WPARAM_MAGIC, 1000, 0x0002, 400, ctypes.byref(lres))
+            u32.UnhookWindowsHookEx(rec["hhook"])
+
+    kb_armed = {}   # appid -> bool (True when ready to trigger on next press)
+    pad_armed = {}  # appid -> bool
+    last_cleanup_ts = 0.0
+    modifier_vks = {16, 17, 18, 160, 161, 162, 163, 164, 165}
+
+    msg_buf = (ctypes.c_ubyte * 64)()
+    u32.PeekMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+    u32.PeekMessageW.restype = ctypes.c_int
+
+    def _toggle_for_aid(aid_s, lg_obj, hint_label):
+        with FF_HOOKS_LOCK:
+            cur_rec = ACTIVE_FF_HOOKS.get(aid_s)
+            cur_spd = float(cur_rec.get("speed", 1.0)) if cur_rec else 1.0
+        target_spd = _sanitize_speed_target(lg_obj.get("speed_target", 2.0), 2.0)
+        next_spd = 1.0 if abs(cur_spd - 1.0) > 0.02 else target_spd
+        if abs(next_spd - 1.0) <= 0.02 and abs(cur_spd - 1.0) <= 0.02:
+            return
+        ok_t, _ = _apply_on_owner_thread(aid_s, next_spd)
+        if ok_t:
+            gtitle = lg_obj.get("name") or f"App {aid_s}"
+            enqueue_speed_popup(aid_s, gtitle, next_spd, bind_hint=hint_label)
+
+    while True:
+        try:
+            while u32.PeekMessageW(msg_buf, None, 0, 0, 1):
+                pass
+            # 1. Process any immediate UI commands on this owner thread
+            while True:
+                try:
+                    cmd, c_aid, c_spd, c_evt, c_box = SPEED_CMD_QUEUE.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if cmd == "set":
+                        ok_c, err_c = _apply_on_owner_thread(c_aid, c_spd)
+                        c_box["ok"] = ok_c
+                        c_box["error"] = err_c
+                    elif cmd == "detach":
+                        _detach_on_owner_thread(c_aid, c_spd > 0.5)
+                        c_box["ok"] = True
+                except Exception as ex:
+                    c_box["ok"] = False
+                    c_box["error"] = str(ex)
+                finally:
+                    c_evt.set()
+
+            # 2. Periodically clean up hooks whose game window has closed
+            now = time.time()
+            if (now - last_cleanup_ts) > 1.5:
+                last_cleanup_ts = now
+                with FF_HOOKS_LOCK:
+                    stale_aids = [k for k, v in ACTIVE_FF_HOOKS.items() if not u32.IsWindow(v.get("hwnd"))]
+                for s_aid in stale_aids:
+                    _detach_on_owner_thread(s_aid, False)
+
+            # 3. Check custom Keyboard & Stick/Gamepad toggle bindings ONLY when opted-in Local Game is focused
+            local_games = load_local_games()
+            eligible = [
+                (aid, lg) for aid, lg in local_games.items()
+                if lg.get("speed_enabled") and (lg.get("speed_kb_bind") or lg.get("speed_pad_bind"))
+            ]
+            if not eligible:
+                time.sleep(0.06)
+                continue
+
+            fg_hwnd = u32.GetForegroundWindow()
+            fg_pid_val = 0
+            if fg_hwnd:
+                fg_pid = ctypes.c_uint32(0)
+                u32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+                fg_pid_val = int(fg_pid.value)
+
+            if not fg_pid_val:
+                time.sleep(0.05)
+                continue
+
+            focused_pair = None
+            for aid, lg in eligible:
+                pids = get_local_game_running_pids(aid)
+                if fg_pid_val in pids:
+                    focused_pair = (aid, lg)
+                    break
+
+            if not focused_pair:
+                time.sleep(0.05)
+                continue
+
+            f_aid, f_lg = focused_pair
+
+            # 3a. Custom Keyboard Toggle check
+            kb_bind = f_lg.get("speed_kb_bind")
+            if kb_bind and kb_bind.get("vks"):
+                vks = kb_bind["vks"]
+                all_pressed = all((u32.GetAsyncKeyState(int(vk)) & 0x8000) != 0 for vk in vks)
+                # Avoid accidental trigger on Alt+F4 if user bound F4 without Alt
+                if all_pressed and not any(int(vk) in modifier_vks for vk in vks):
+                    if (u32.GetAsyncKeyState(0x12) & 0x8000) != 0:
+                        all_pressed = False
+                if all_pressed:
+                    if kb_armed.get(f_aid, True):
+                        kb_armed[f_aid] = False
+                        _toggle_for_aid(f_aid, f_lg, kb_bind.get("label", "Keyboard"))
+                else:
+                    any_pressed = any((u32.GetAsyncKeyState(int(vk)) & 0x8000) != 0 for vk in vks)
+                    if not any_pressed:
+                        kb_armed[f_aid] = True
+
+            # 3b. Custom Stick / Controller Toggle check (XInput + DirectInput)
+            pad_bind = f_lg.get("speed_pad_bind")
+            if pad_bind and pad_bind.get("mask"):
+                req_mask = int(pad_bind["mask"])
+                cur_src, cur_pad_m = _read_gamepad_state()
+                if cur_src == pad_bind.get("source", "xinput") and (cur_pad_m & req_mask) == req_mask:
+                    if pad_armed.get(f_aid, True):
+                        pad_armed[f_aid] = False
+                        _toggle_for_aid(f_aid, f_lg, pad_bind.get("label", "Stick"))
+                elif (cur_pad_m & req_mask) == 0:
+                    pad_armed[f_aid] = True
+
+            time.sleep(0.035)
+        except Exception:
+            time.sleep(0.1)
 
 def _get_cached_schema_json_path(appid):
     return os.path.join(LOCAL_DATA_ROOT, "schemas", f"{appid}.json")
@@ -525,10 +1247,11 @@ def parse_game_achievement_schema(steam_path, appid, allow_remote=False):
     return []
 
 def get_emulator_achievement_candidates(appid, install_dir=""):
-    """Return list of (emu_kind, file_path) for known Steam emulators (RUNE, CODEX, Goldberg, GSE, FLT, OnlineFix, Tenoke, SKIDROW)."""
+    """Return list of (emu_kind, file_path) for known Steam emulators (RUNE, CODEX, Goldberg, GSE, FLT, OnlineFix, Tenoke, SKIDROW/STEAMRIP)."""
     aid_s = str(appid).strip()
     sys_drive = os.environ.get("SystemDrive", "C:")
     pub_docs = os.path.join(os.environ.get("PUBLIC", os.path.join(sys_drive, "Users", "Public")), "Documents")
+    user_docs = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Documents")
     appdata = os.environ.get("APPDATA", os.path.expanduser(r"~\AppData\Roaming"))
     localapp = os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
 
@@ -549,8 +1272,14 @@ def get_emulator_achievement_candidates(appid, install_dir=""):
         ("flt_ini", os.path.join(appdata, "FLT", aid_s, "stats", "achievements.ini")),
         ("onlinefix_ini", os.path.join(pub_docs, "OnlineFix", aid_s, "Stats", "Achievements.ini")),
         ("skidrow_ini", os.path.join(localapp, "SKIDROW", aid_s, "Storage", "achievements.ini")),
+        ("skidrow_at_ini", os.path.join(user_docs, "STEAMRIP", aid_s, "SteamEmu", "UserStats", "achiev.ini")),
+        ("skidrow_at_ini", os.path.join(user_docs, "SKIDROW", aid_s, "SteamEmu", "UserStats", "achiev.ini")),
         ("sse_ini", os.path.join(appdata, "SmartSteamEmu", aid_s, "achievements.ini")),
     ]
+    if os.path.isdir(user_docs):
+        for sr_fp in glob.glob(os.path.join(user_docs, "*", aid_s, "SteamEmu", "UserStats", "achiev.ini")):
+            raw_cands.append(("skidrow_at_ini", sr_fp))
+
     if install_dir and os.path.isdir(install_dir):
         raw_cands.extend([
             ("tenoke_ini", os.path.join(install_dir, "SteamData", "user_stats.ini")),
@@ -558,6 +1287,16 @@ def get_emulator_achievement_candidates(appid, install_dir=""):
             ("codex_ini", os.path.join(install_dir, "Profile", "Stats", "Achievements.ini")),
             ("codex_ini", os.path.join(install_dir, "Profile", "VALVE", "Stats", "Achievements.ini")),
         ])
+        try:
+            for r_dir, d_list, f_list in os.walk(install_dir):
+                rel_d = os.path.relpath(r_dir, install_dir)
+                if rel_d != "." and rel_d.count(os.sep) >= 4:
+                    d_list[:] = []
+                    continue
+                if "user_stats.ini" in [x.lower() for x in f_list] and os.path.basename(r_dir).lower() == "steamdata":
+                    raw_cands.append(("tenoke_ini", os.path.join(r_dir, "user_stats.ini")))
+        except Exception:
+            pass
 
     seen = set()
     unique = []
@@ -646,23 +1385,33 @@ def _parse_emulator_achievement_file(kind, fp):
                 unlocked_by_api[cand_name] = file_mtime
             else:
                 own_sec = sections[own_sec_key]
-                ach_val = str(own_sec.get("Achieved") or own_sec.get("achieved") or own_sec.get("State") or own_sec.get("Unlocked") or "1").strip().lower()
+                own_ci = {x.lower(): y for x, y in own_sec.items()}
+                ach_val = str(own_ci.get("achieved", own_ci.get("state", own_ci.get("unlocked", "0")))).strip().lower()
                 if ach_val in ("1", "true", "yes"):
-                    ts_raw = own_sec.get("UnlockTime") or own_sec.get("unlocktime") or own_sec.get("Time") or "0"
-                    ts_i = int(ts_raw) if str(ts_raw).isdigit() and int(ts_raw) > 0 else file_mtime
+                    ts_raw = str(own_ci.get("unlocktime", own_ci.get("time", "0"))).strip()
+                    ts_i = int(ts_raw) if ts_raw.isdigit() and int(ts_raw) > 0 else file_mtime
                     unlocked_by_api[own_sec_key] = ts_i
 
-    # 3. Individual [Achievement_API_Name] sections & [ACHIEVEMENTS] block (Tenoke / OnlineFix / CODEX)
+    # 3. Individual [Achievement_API_Name] sections & [ACHIEVEMENTS] block (Tenoke / OnlineFix / SKIDROW / CODEX)
     for sec_name, kv in sections.items():
         if not sec_name:
             continue
         s_low = sec_name.lower()
-        if s_low in ("steamachievements", "steamstats", "stats", "leaderboards", "settings"):
+        if s_low in ("steamachievements", "steamstats", "stats", "leaderboards", "settings", "userstats"):
             continue
         if s_low in ("achievements", "achiev"):
             for ak, av in kv.items():
                 clean_k = ak.strip().strip('"')
-                av_low = av.lower()
+                av_str = av.strip()
+                av_low = av_str.lower()
+                # SKIDROW SteamEmu format: API_NAME=1@API_NAME@...@<unlock_timestamp>
+                if "@" in av_str:
+                    at_parts = av_str.split("@")
+                    if at_parts and at_parts[0].strip() in ("1", "true"):
+                        last_ts = at_parts[-1].strip()
+                        ts_i = int(last_ts) if last_ts.isdigit() and int(last_ts) > 0 else file_mtime
+                        unlocked_by_api[clean_k] = ts_i
+                    continue
                 if av_low in ("1", "true", "yes") or "unlocked = true" in av_low or "unlocked=true" in av_low or "achieved = 1" in av_low:
                     m_ts = re.search(r"time\s*=\s*(\d+)", av_low)
                     ts_i = int(m_ts.group(1)) if (m_ts and int(m_ts.group(1)) > 0) else file_mtime
@@ -711,21 +1460,41 @@ def read_emulator_achievements(steam_path, appid, install_dir=""):
     return unlocked
 
 def apply_personal_achievements_to_emu_files(appid, personal_map, schema):
-    """Sync personal achievements back to existing RUNE/CODEX achievements.ini or Goldberg achievements.json when game is idle."""
+    """Sync personal achievements & pre-seed full schema into RUNE/CODEX achievements.ini (so GetAchievement returns True!) or Goldberg JSON."""
     aid_s = str(appid)
     if not schema:
         return False
-    key_to_api = {item["key"]: item["api_name"] for item in schema if item.get("api_name")}
+    all_api_names = []
+    seen_api = set()
+    key_to_api = {}
+    for item in schema:
+        an = str(item.get("api_name") or "").strip()
+        if an:
+            key_to_api[item["key"]] = an
+            if an not in seen_api:
+                seen_api.add(an)
+                all_api_names.append(an)
+
     unlocked_api = {}
     for k, ts in (personal_map or {}).items():
         if ts and int(ts) > 0 and k in key_to_api:
             unlocked_api[key_to_api[k]] = int(ts)
 
+    # Ensure primary RUNE / CODEX Public Documents folder exists for registered RUNE/CODEX Local Games even before first launch
+    lg = load_local_games().get(aid_s)
+    if lg:
+        emu_t = (lg.get("emu_type") or "").strip().upper()
+        sys_drive = os.environ.get("SystemDrive", "C:")
+        pub_docs = os.path.join(os.environ.get("PUBLIC", os.path.join(sys_drive, "Users", "Public")), "Documents")
+        if emu_t == "RUNE":
+            os.makedirs(os.path.join(pub_docs, "Steam", "RUNE", aid_s), exist_ok=True)
+        elif emu_t == "CODEX":
+            os.makedirs(os.path.join(pub_docs, "Steam", "CODEX", aid_s), exist_ok=True)
+
     wrote = False
     for kind, fp in get_emulator_achievement_candidates(aid_s):
         parent_dir = os.path.dirname(fp)
         if not os.path.isfile(fp):
-            # Only create file if the emulator's appid directory already exists (e.g. Public\Documents\Steam\RUNE\625960)
             if kind not in ("rune_ini", "codex_ini", "goldberg_json") or not os.path.isdir(parent_dir):
                 continue
         try:
@@ -739,14 +1508,18 @@ def apply_personal_achievements_to_emu_files(appid, personal_map, schema):
                     except Exception:
                         pass
                 new_obj = {}
-                for aname, val in cur_obj.items():
-                    if aname not in unlocked_api and isinstance(val, dict):
-                        val_copy = dict(val)
-                        val_copy["earned"] = False
-                        val_copy["earned_time"] = 0
-                        new_obj[aname] = val_copy
-                for aname, ts in unlocked_api.items():
-                    new_obj[aname] = {"earned": True, "earned_time": int(ts)}
+                for aname in all_api_names:
+                    if aname in unlocked_api:
+                        new_obj[aname] = {"earned": True, "earned_time": int(unlocked_api[aname])}
+                    else:
+                        prev_v = cur_obj.get(aname)
+                        if isinstance(prev_v, dict):
+                            vc = dict(prev_v)
+                            vc["earned"] = False
+                            vc["earned_time"] = 0
+                            new_obj[aname] = vc
+                        else:
+                            new_obj[aname] = {"earned": False, "earned_time": 0}
                 with open(fp, "w", encoding="utf-8") as f:
                     json.dump(new_obj, f, indent=2)
                 wrote = True
@@ -768,29 +1541,41 @@ def apply_personal_achievements_to_emu_files(appid, personal_map, schema):
                         for s_name, kv in sec_map.items():
                             if s_name.lower() in ("steamachievements", ""):
                                 continue
-                            kv_ci = {a.lower(): b for a, b in kv.items()}
-                            if str(kv_ci.get("achieved", "0")).strip() == "0" and s_name not in unlocked_api:
-                                preserved_progress[s_name] = kv
+                            preserved_progress[s_name] = kv
                     except Exception:
                         pass
 
-                lines = ["[SteamAchievements]", f"Count={len(unlocked_api)}"]
-                sorted_unlocked = sorted(unlocked_api.items(), key=lambda x: x[1])
-                for idx, (aname, _) in enumerate(sorted_unlocked):
+                # IMPORTANT: RUNE/CODEX GetAchievement(apiName) returns FALSE unless apiName is listed in [SteamAchievements]!
+                # Register ALL schema achievements in [SteamAchievements] with Achieved=1 (unlocked) or Achieved=0 (locked).
+                ordered_names = list(all_api_names)
+                for extra_u in unlocked_api:
+                    if extra_u not in seen_api:
+                        ordered_names.append(extra_u)
+
+                lines = ["[SteamAchievements]"]
+                for idx, aname in enumerate(ordered_names):
                     lines.append(f"{idx:05d}={aname}")
+                lines.append(f"Count={len(ordered_names)}")
                 lines.append("")
-                for aname, ts in sorted_unlocked:
+
+                for aname in ordered_names:
+                    prev_kv = preserved_progress.get(aname, {})
+                    prev_ci = {a.lower(): b for a, b in prev_kv.items()}
+                    cur_p = str(prev_ci.get("curprogress", "0"))
+                    max_p = str(prev_ci.get("maxprogress", "0"))
                     lines.append(f"[{aname}]")
-                    lines.append("Achieved=1")
-                    lines.append("CurProgress=0")
-                    lines.append("MaxProgress=0")
-                    lines.append(f"UnlockTime={int(ts)}")
+                    if aname in unlocked_api:
+                        lines.append("Achieved=1")
+                        lines.append(f"CurProgress={cur_p}")
+                        lines.append(f"MaxProgress={max_p}")
+                        lines.append(f"UnlockTime={int(unlocked_api[aname])}")
+                    else:
+                        lines.append("Achieved=0")
+                        lines.append(f"CurProgress={cur_p}")
+                        lines.append(f"MaxProgress={max_p}")
+                        lines.append("UnlockTime=0")
                     lines.append("")
-                for p_name, p_kv in preserved_progress.items():
-                    lines.append(f"[{p_name}]")
-                    for pk, pv in p_kv.items():
-                        lines.append(f"{pk}={pv}")
-                    lines.append("")
+
                 with open(fp, "w", encoding="utf-8", newline="\r\n") as f:
                     f.write("\n".join(lines))
                 wrote = True
@@ -2081,6 +2866,8 @@ def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
                     build_full_state()
                 time.sleep(1.2)
             # 3. Game just closed! Final achievement capture + Cloud Save upload if enabled
+            if not sid3:
+                detach_local_speed_hook(appid, restore_normal=False)
             time.sleep(1.2)
             new_ach = capture_new_achievements_from_steam_bin(
                 steam_path, sid3, appid, session_start_ts=session_start_ts, game_name=game_name, trigger_popup=True
@@ -2141,10 +2928,12 @@ def global_game_watcher_loop():
         sp = reg["steam_path"]
         # 1. Sync personal achievements with Cloud on startup
         sync_cloud_achievements_bundle(sp, direction="both")
-        # 2. Import any pre-existing unlocked emulator achievements for Local Games without popup spam
+        # 2. Import any pre-existing unlocked emulator achievements & pre-seed RUNE/CODEX schemas for Local Games
         for l_aid, lg in load_local_games().items():
-            parse_game_achievement_schema(sp, l_aid, allow_remote=True)
+            l_schema = parse_game_achievement_schema(sp, l_aid, allow_remote=True)
             capture_new_achievements_from_steam_bin(sp, "", l_aid, session_start_ts=0, game_name=lg.get("name", ""), trigger_popup=False)
+            if l_schema and not is_local_game_running(l_aid):
+                apply_personal_achievements_to_emu_files(l_aid, get_game_personal_achievements(l_aid), l_schema)
         # 3. Import existing Steam achievements from Online (Personal) accounts so they are never lost
         accounts = parse_loginusers(sp)
         installed = get_installed_games(sp)
@@ -2399,6 +3188,103 @@ def find_local_cover(steam_path, appid):
         return custom_cov
     return None
 
+def _resolve_hashed_steam_cover_urls(appid):
+    """Query Steam IStoreBrowseService/GetItems/v1 for hashed cover URLs used by newer (2024+) Steam games."""
+    aid_s = str(appid).strip()
+    if not aid_s.isdigit():
+        return []
+    urls = []
+    try:
+        inp = json.dumps({
+            "ids": [{"appid": int(aid_s)}],
+            "context": {"language": "english", "country_code": "US"},
+            "data_request": {"include_assets": True}
+        }, separators=(",", ":"))
+        api_url = f"https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json={urllib.parse.quote(inp)}"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            obj = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        items = (obj.get("response") or {}).get("store_items") or []
+        if items and isinstance(items[0], dict):
+            assets = items[0].get("assets") or {}
+            fmt = str(assets.get("asset_url_format") or f"steam/apps/{aid_s}/${{FILENAME}}")
+            for key in ("library_capsule_2x", "library_capsule", "header_2x", "header", "main_capsule"):
+                rel = assets.get(key)
+                if rel:
+                    rel_path = fmt.replace("${FILENAME}", str(rel)).lstrip("/")
+                    urls.append(f"https://shared.akamai.steamstatic.com/store_item_assets/{rel_path}")
+    except Exception:
+        pass
+    if not urls:
+        try:
+            ad_url = f"https://store.steampowered.com/api/appdetails?appids={aid_s}&l=english"
+            req2 = urllib.request.Request(ad_url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+            with urllib.request.urlopen(req2, timeout=7) as resp2:
+                obj2 = json.loads(resp2.read().decode("utf-8", errors="ignore"))
+            data_blk = (obj2.get(aid_s) or {}).get("data") or {}
+            for k in ("header_image", "capsule_imagev5", "capsule_image"):
+                if data_blk.get(k):
+                    urls.append(str(data_blk[k]))
+        except Exception:
+            pass
+    return urls
+
+def download_and_cache_steam_cover(appid):
+    """Download official vertical Steam cover (supporting both legacy flat URLs and new SHA1-hashed URLs) and cache locally."""
+    aid_s = str(appid).strip()
+    if not aid_s.isdigit():
+        return b""
+    cov_dst = _get_cached_cover_path(aid_s)
+    os.makedirs(os.path.dirname(cov_dst), exist_ok=True)
+
+    candidate_urls = [
+        f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{aid_s}/library_600x900.jpg",
+    ]
+    for idx, url in enumerate(candidate_urls):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+            with urllib.request.urlopen(req, timeout=7) as r:
+                raw = r.read()
+                if raw and len(raw) > 1024:
+                    with open(cov_dst, "wb") as cf:
+                        cf.write(raw)
+                    COVER_CACHE[aid_s] = raw
+                    COVER_B64_CACHE[aid_s] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+                    return raw
+        except Exception:
+            pass
+
+    # Newer Steam games store assets under hashed paths; query IStoreBrowseService/GetItems
+    for url in _resolve_hashed_steam_cover_urls(aid_s):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                raw = r.read()
+                if raw and len(raw) > 1024:
+                    with open(cov_dst, "wb") as cf:
+                        cf.write(raw)
+                    COVER_CACHE[aid_s] = raw
+                    COVER_B64_CACHE[aid_s] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+                    return raw
+        except Exception:
+            pass
+
+    # Legacy header fallback
+    try:
+        h_url = f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{aid_s}/header.jpg"
+        req = urllib.request.Request(h_url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+        with urllib.request.urlopen(req, timeout=7) as r:
+            raw = r.read()
+            if raw and len(raw) > 1024:
+                with open(cov_dst, "wb") as cf:
+                    cf.write(raw)
+                COVER_CACHE[aid_s] = raw
+                COVER_B64_CACHE[aid_s] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+                return raw
+    except Exception:
+        pass
+    return b""
+
 def ensure_local_game_assets_async(steam_path, appid):
     """Background fetch & cache of official Steam cover art and achievement schema for Local Games."""
     aid_s = str(appid).strip()
@@ -2421,25 +3307,9 @@ def ensure_local_game_assets_async(steam_path, appid):
                 if achs is not None:
                     changed = True
             if need_cover:
-                cov_dst = _get_cached_cover_path(aid_s)
-                os.makedirs(os.path.dirname(cov_dst), exist_ok=True)
-                for url in (
-                    f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{aid_s}/library_600x900.jpg",
-                    f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{aid_s}/header.jpg",
-                ):
-                    try:
-                        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
-                        with urllib.request.urlopen(req, timeout=8) as r:
-                            raw = r.read()
-                            if raw and len(raw) > 1024:
-                                with open(cov_dst, "wb") as cf:
-                                    cf.write(raw)
-                                COVER_CACHE[aid_s] = raw
-                                COVER_B64_CACHE[aid_s] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
-                                changed = True
-                                break
-                    except Exception:
-                        pass
+                raw_cov = download_and_cache_steam_cover(aid_s)
+                if raw_cov:
+                    changed = True
             if changed:
                 build_full_state()
         finally:
@@ -2672,6 +3542,7 @@ def _detect_appid_and_emulator_in_dir(install_dir, exe_path=""):
                 ("ali213.ini", "ALI213", r"^\s*AppID\s*=\s*(\d+)"),
                 ("valve.ini", "ALI213", r"^\s*AppID\s*=\s*(\d+)"),
                 ("skidrow.ini", "SKIDROW", r"^\s*AppId\s*=\s*(\d+)"),
+                ("steam_api.ini", "SKIDROW", r"^\s*AppId\s*=\s*(\d+)"),
                 ("smartsteamemu.ini", "SmartSteamEmu", r"^\s*AppId\s*=\s*(\d+)"),
             ):
                 if ini_name in files_low:
@@ -3293,6 +4164,20 @@ def build_full_state():
         ach_unlocked_cnt = sum(1 for k, v in pers_ach.items() if v and (not valid_ach_keys or k in valid_ach_keys))
         patch_info = get_game_patch_info(aid, name, inst_info, cloud_patches)
 
+        is_run_now = str(aid) in running_ids
+        speed_info = (
+            get_local_game_speed_state(aid, is_running=is_run_now)
+            if is_local_only else {
+                "speed_enabled": False,
+                "speed_target": 2.0,
+                "speed_current": 1.0,
+                "speed_active": False,
+                "speed_kb_bind": None,
+                "speed_pad_bind": None,
+                "speed_engine": ""
+            }
+        )
+
         games_list.append({
             "appid": aid,
             "name": name,
@@ -3302,7 +4187,7 @@ def build_full_state():
             "save_dir": lg_entry.get("save_dir", "") if lg_entry else "",
             "emu_type": lg_entry.get("emu_type", "") if lg_entry else "",
             "installed": inst_info is not None,
-            "running": str(aid) in running_ids,
+            "running": is_run_now,
             "uploading": str(aid) in uploading_ids,
             "cloud_enabled": str(aid) in enabled_cloud_ids,
             "size_gb": inst_info["size_gb"] if inst_info else 0,
@@ -3317,6 +4202,7 @@ def build_full_state():
             "local_save_mtime": save_mtime,
             "ach_unlocked": ach_unlocked_cnt,
             "ach_total": len(ach_schema),
+            **speed_info,
             **patch_info
         })
 
@@ -3493,7 +4379,7 @@ def launch_local_game(appid, game_name="", conflict_choice=""):
     capture_new_achievements_from_steam_bin(steam_path, "", aid_s, session_start_ts=0, game_name=gtitle, trigger_popup=False)
     apply_personal_achievements_to_steam_bin(steam_path, "", aid_s)
 
-    # 3. Launch .exe directly without restarting/switching Steam
+    # 3. Launch .exe directly without restarting/switching Steam (zero game folder files touched)
     try:
         work_dir = os.path.dirname(exe_path) or install_dir or None
         proc = subprocess.Popen(
@@ -3703,6 +4589,7 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "running_appids": get_running_appids(),
                 "uploading_appids": get_uploading_appids(),
+                "active_speeds": get_active_local_speeds_summary(),
                 "last_uploads": LAST_UPLOAD_MSG,
                 "last_achievements": LAST_ACHIEVEMENT_UNLOCK,
                 "active_account": get_steam_registry_info().get("auto_login_user", "")
@@ -3719,8 +4606,11 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                     try:
                         raw = open(local_img, "rb").read()
                         COVER_CACHE[appid] = raw
+                        COVER_B64_CACHE[appid] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
                     except Exception:
                         pass
+            if not raw:
+                raw = download_and_cache_steam_cover(appid)
             if raw:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
@@ -3729,10 +4619,18 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(raw)
                 return
-            cdn_url = f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid}/library_600x900.jpg"
-            self.send_response(302)
-            self.send_header("Location", cdn_url)
+            svg_placeholder = (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450" viewBox="0 0 300 450">'
+                '<rect width="300" height="450" fill="#1e1e24"/>'
+                '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-size="48">🎮</text>'
+                '</svg>'
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(svg_placeholder)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            self.wfile.write(svg_placeholder)
             return
 
         self.send_error(404)
@@ -4156,6 +5054,7 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             if old_appid and old_appid != appid and old_appid in local_games:
                 local_games.pop(old_appid, None)
 
+            want_speed = bool(payload["speed_enabled"]) if "speed_enabled" in payload else bool(prev_entry.get("speed_enabled", False))
             local_games[appid] = {
                 "appid": appid,
                 "name": final_name,
@@ -4163,14 +5062,22 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
                 "install_dir": os.path.normpath(install_dir),
                 "save_dir": final_save_dir,
                 "emu_type": meta["emu_type"],
+                "speed_enabled": want_speed,
+                "speed_target": _sanitize_speed_target(prev_entry.get("speed_target", 2.0), 2.0),
+                "speed_kb_bind": _sanitize_kb_bind(prev_entry.get("speed_kb_bind")),
+                "speed_pad_bind": _sanitize_pad_bind(prev_entry.get("speed_pad_bind")),
                 "added_at": int(prev_entry.get("added_at") or time.time()),
                 "last_played": int(prev_entry.get("last_played") or 0),
             }
             save_local_games(local_games)
+            if not want_speed and prev_entry.get("speed_enabled"):
+                detach_local_speed_hook(appid, restore_normal=True)
 
-            # Fetch achievement schema & import any already-unlocked emulator achievements immediately
+            # Fetch achievement schema, import existing emulator achievements, and pre-seed RUNE/CODEX schema immediately
             schema = parse_game_achievement_schema(steam_path, appid, allow_remote=True)
             capture_new_achievements_from_steam_bin(steam_path, "", appid, session_start_ts=0, game_name=final_name, trigger_popup=False)
+            if schema and not is_local_game_running(appid):
+                apply_personal_achievements_to_emu_files(appid, get_game_personal_achievements(appid), schema)
             ensure_local_game_assets_async(steam_path, appid)
             build_full_state()
 
@@ -4185,11 +5092,135 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/api/remove_local_game":
             appid = str(payload.get("appid") or "").strip()
             local_games = load_local_games()
+            if appid in local_games and local_games[appid].get("speed_enabled"):
+                detach_local_speed_hook(appid, restore_normal=True)
             removed = local_games.pop(appid, None)
             save_local_games(local_games)
             build_full_state()
             gtitle = (removed or {}).get("name") or f"App {appid}"
             self.send_json({"ok": True, "message": f"'{gtitle}' dihapus dari daftar Game Lokal (file game di PC tetap aman)."})
+            return
+
+        if self.path == "/api/local_speed":
+            appid = str(payload.get("appid") or "").strip()
+            action = str(payload.get("action") or "set_speed").strip()
+            if not _is_strictly_local_game(appid):
+                self.send_json({
+                    "ok": False,
+                    "message": "Fitur fast-forward dikunci khusus untuk Game Lokal (Offline Single-Player)."
+                }, 403)
+                return
+
+            local_games = load_local_games()
+            lg = local_games.get(appid)
+            if not lg:
+                self.send_json({"ok": False, "message": "Game lokal tidak ditemukan."}, 404)
+                return
+
+            if action == "toggle_enable":
+                enabled = bool(payload.get("enabled", False))
+                if not enabled:
+                    detach_local_speed_hook(appid, restore_normal=True)
+                lg["speed_enabled"] = enabled
+                local_games[appid] = lg
+                save_local_games(local_games)
+                is_run = is_local_game_running(appid)
+                st_info = get_local_game_speed_state(appid, is_running=is_run)
+                msg_s = (
+                    f"⚡ Fast-Forward diaktifkan untuk '{lg.get('name', appid)}' (tanpa menyentuh file game)!"
+                    if enabled else f"Fitur Fast-Forward dinonaktifkan untuk '{lg.get('name', appid)}'."
+                )
+                build_full_state()
+                self.send_json({"ok": True, "message": msg_s, **st_info})
+                return
+
+            if action == "set_target":
+                target_spd = _sanitize_speed_target(payload.get("speed_target", 2.0), 2.0)
+                lg["speed_target"] = target_spd
+                local_games[appid] = lg
+                save_local_games(local_games)
+                is_run = is_local_game_running(appid)
+                st_cur = get_local_game_speed_state(appid, is_running=is_run)
+                # If fast-forward is currently ON while user edits manual number, apply live immediately
+                if is_run and st_cur.get("speed_active"):
+                    ok_sp, res_sp = set_local_game_speed(appid, target_spd, show_overlay=False)
+                    build_full_state()
+                    if isinstance(res_sp, dict):
+                        self.send_json({"ok": ok_sp, **res_sp}, 200 if ok_sp else 400)
+                    else:
+                        self.send_json({"ok": ok_sp, "message": str(res_sp)}, 200 if ok_sp else 400)
+                    return
+                build_full_state()
+                st_info = get_local_game_speed_state(appid, is_running=is_run)
+                self.send_json({
+                    "ok": True,
+                    "message": f"Target kecepatan disimpan: {target_spd:g}x",
+                    **st_info
+                })
+                return
+
+            if action == "toggle_active":
+                ok_t, res_t = toggle_local_game_speed_now(appid, show_overlay=False)
+                build_full_state()
+                if isinstance(res_t, dict):
+                    self.send_json({"ok": ok_t, **res_t}, 200 if ok_t else 400)
+                else:
+                    self.send_json({"ok": ok_t, "message": str(res_t)}, 200 if ok_t else 400)
+                return
+
+            if action == "set_kb_bind":
+                kb_b = _sanitize_kb_bind(payload.get("kb_bind"))
+                lg["speed_kb_bind"] = kb_b
+                local_games[appid] = lg
+                save_local_games(local_games)
+                build_full_state()
+                st_info = get_local_game_speed_state(appid)
+                msg_kb = f"⌨ Toggle Keyboard diatur ke: {kb_b['label']}" if kb_b else "⌨ Toggle Keyboard dikosongkan."
+                self.send_json({"ok": True, "message": msg_kb, **st_info})
+                return
+
+            if action == "set_pad_bind":
+                pad_b = _sanitize_pad_bind(payload.get("pad_bind"))
+                lg["speed_pad_bind"] = pad_b
+                local_games[appid] = lg
+                save_local_games(local_games)
+                build_full_state()
+                st_info = get_local_game_speed_state(appid)
+                msg_pd = f"🎮 Toggle Stick diatur ke: {pad_b['label']}" if pad_b else "🎮 Toggle Stick dikosongkan."
+                self.send_json({"ok": True, "message": msg_pd, **st_info})
+                return
+
+            if action == "capture_pad":
+                captured, cap_err = capture_gamepad_binding(timeout_sec=6.5)
+                if not captured:
+                    self.send_json({"ok": False, "message": cap_err}, 200)
+                    return
+                lg = load_local_games().get(appid, lg)
+                lg["speed_pad_bind"] = captured
+                local_games = load_local_games()
+                local_games[appid] = lg
+                save_local_games(local_games)
+                build_full_state()
+                st_info = get_local_game_speed_state(appid)
+                self.send_json({
+                    "ok": True,
+                    "message": f"🎮 Toggle Stick berhasil diatur ke: {captured['label']}!",
+                    **st_info
+                })
+                return
+
+            if action == "cancel_capture_pad":
+                CAPTURE_PAD_CANCEL.set()
+                self.send_json({"ok": True})
+                return
+
+            speed_val = payload.get("speed", 1.0)
+            ok_sp, res_sp = set_local_game_speed(appid, speed_val, show_overlay=False)
+            build_full_state()
+            if isinstance(res_sp, dict):
+                self.send_json({"ok": ok_sp, **res_sp}, 200 if ok_sp else 400)
+            else:
+                self.send_json({"ok": ok_sp, "message": str(res_sp)}, 200 if ok_sp else 400)
             return
 
         if self.path == "/api/open_local_folder":
@@ -4356,7 +5387,7 @@ OVERLAY_HTML_PAGE = """<!DOCTYPE html>
     <img class="ach-icon" id="toastIcon" src="" alt="" />
     <div class="ach-body">
       <div class="ach-header">
-        <span class="ach-tag">🏆 ACHIEVEMENT TERBUKA</span>
+        <span class="ach-tag" id="toastTag">🏆 ACHIEVEMENT TERBUKA</span>
         <span class="ach-prog" id="toastProg">1/1</span>
       </div>
       <div class="ach-title" id="toastTitle">Achievement</div>
@@ -4366,6 +5397,9 @@ OVERLAY_HTML_PAGE = """<!DOCTYPE html>
 <script>
   const FALLBACK_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#1e293b"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="28">🏆</text></svg>'
+  );
+  const SPEED_SVG = "data:image/svg+xml;utf8," + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#172554"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="30">⚡</text></svg>'
   );
   const iconEl = document.getElementById('toastIcon');
   iconEl.onerror = function() {
@@ -4378,55 +5412,78 @@ OVERLAY_HTML_PAGE = """<!DOCTYPE html>
     iconEl.src = FALLBACK_SVG;
   };
 
-  function playUnlockSound() {
+  function playUnlockSound(isSpeed) {
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
       const ctx = new Ctx();
       const now = ctx.currentTime;
-      const notes = [523.25, 659.25, 783.99, 1046.50];
+      const notes = isSpeed ? [587.33, 880.0] : [523.25, 659.25, 783.99, 1046.50];
       notes.forEach((freq, idx) => {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(freq, now + idx * 0.085);
-        gain.gain.setValueAtTime(0.001, now + idx * 0.085);
-        gain.gain.exponentialRampToValueAtTime(0.18, now + idx * 0.085 + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.085 + 0.55);
+        osc.type = isSpeed ? 'sine' : 'triangle';
+        const step = isSpeed ? 0.055 : 0.085;
+        osc.frequency.setValueAtTime(freq, now + idx * step);
+        gain.gain.setValueAtTime(0.001, now + idx * step);
+        gain.gain.exponentialRampToValueAtTime(isSpeed ? 0.11 : 0.18, now + idx * step + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * step + (isSpeed ? 0.22 : 0.55));
         osc.connect(gain);
         gain.connect(ctx.destination);
-        osc.start(now + idx * 0.085);
-        osc.stop(now + idx * 0.085 + 0.6);
+        osc.start(now + idx * step);
+        osc.stop(now + idx * step + (isSpeed ? 0.25 : 0.6));
       });
     } catch (e) {}
   }
 
   let queue = [];
   let showing = false;
+  let currentKind = '';
+  let extendSpeedUntil = 0;
+
+  function renderPopupItem(item) {
+    const isSpeed = item.kind === 'speed';
+    currentKind = item.kind || 'ach';
+    iconEl.dataset.cf = '';
+    iconEl.src = isSpeed ? SPEED_SVG : (item.icon_url || FALLBACK_SVG);
+    iconEl.style.borderColor = isSpeed ? '#38bdf8' : '#facc15';
+    document.getElementById('toastBox').style.borderColor = isSpeed ? 'rgba(56, 189, 248, 0.6)' : 'rgba(250, 204, 21, 0.55)';
+    document.getElementById('toastTag').textContent = isSpeed ? '⚡ KECEPATAN GAME LOKAL' : '🏆 ACHIEVEMENT TERBUKA';
+    document.getElementById('toastTag').style.color = isSpeed ? '#38bdf8' : '#facc15';
+    document.getElementById('toastTitle').textContent = item.title || 'Achievement Unlocked';
+    document.getElementById('toastDesc').textContent = item.description || item.game_name || '';
+    document.getElementById('toastProg').textContent = isSpeed ? (item.prog_label || '1x') : `${item.unlocked_count || 1}/${item.total_count || 1}`;
+  }
 
   async function processQueue() {
     if (showing || queue.length === 0) return;
     showing = true;
     const item = queue.shift();
+    const isSpeed = item.kind === 'speed';
     document.title = 'SHOW_OVERLAY';
-    iconEl.dataset.cf = '';
-    iconEl.src = item.icon_url || FALLBACK_SVG;
-    document.getElementById('toastTitle').textContent = item.title || 'Achievement Unlocked';
-    document.getElementById('toastDesc').textContent = item.description || item.game_name || '';
-    document.getElementById('toastProg').textContent = `${item.unlocked_count || 1}/${item.total_count || 1}`;
+    renderPopupItem(item);
 
-    await new Promise(r => setTimeout(r, 60));
-    playUnlockSound();
+    await new Promise(r => setTimeout(r, 40));
+    playUnlockSound(isSpeed);
     document.getElementById('toastBox').classList.add('visible');
 
-    await new Promise(r => setTimeout(r, 4800));
+    if (isSpeed) {
+      extendSpeedUntil = Date.now() + 1700;
+      while (Date.now() < extendSpeedUntil) {
+        await new Promise(r => setTimeout(r, 120));
+      }
+    } else {
+      await new Promise(r => setTimeout(r, 4800));
+    }
+
     document.getElementById('toastBox').classList.remove('visible');
-    await new Promise(r => setTimeout(r, 420));
+    await new Promise(r => setTimeout(r, 360));
 
     if (queue.length === 0) {
       document.title = 'HIDE_OVERLAY';
     }
     showing = false;
+    currentKind = '';
     if (queue.length > 0) processQueue();
   }
 
@@ -4435,12 +5492,23 @@ OVERLAY_HTML_PAGE = """<!DOCTYPE html>
       const res = await fetch('/api/achievement_popups');
       const data = await res.json();
       if (data && Array.isArray(data.popups) && data.popups.length > 0) {
-        queue.push(...data.popups);
+        for (const p of data.popups) {
+          if (p.kind === 'speed' && showing && currentKind === 'speed') {
+            renderPopupItem(p);
+            playUnlockSound(true);
+            extendSpeedUntil = Date.now() + 1700;
+          } else {
+            if (p.kind === 'speed') {
+              queue = queue.filter(x => x.kind !== 'speed');
+            }
+            queue.push(p);
+          }
+        }
         processQueue();
       }
     } catch (e) {}
   }
-  setInterval(pollPopups, 1100);
+  setInterval(pollPopups, 450);
 </script>
 </body>
 </html>
@@ -4508,6 +5576,10 @@ def open_app_window(hidden=False):
 
 def shutdown_application():
     global TRAY_ICON, UI_HOST_PROC
+    try:
+        detach_all_speed_hooks()
+    except Exception:
+        pass
     try:
         if UI_HOST_PROC is not None and UI_HOST_PROC.poll() is None:
             UI_HOST_PROC.terminate()
@@ -4590,6 +5662,7 @@ if __name__ == "__main__":
     server = ThreadedHTTPServer(("127.0.0.1", PORT), LauncherRequestHandler)
     threading.Thread(target=build_full_state, daemon=True).start()
     threading.Thread(target=global_game_watcher_loop, daemon=True).start()
+    threading.Thread(target=local_speed_hotkey_loop, daemon=True).start()
     open_app_window(hidden=no_window)
     start_system_tray()
     try:

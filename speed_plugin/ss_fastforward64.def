@@ -1,0 +1,4 @@
+LIBRARY ss_fastforward64.dll
+
+EXPORTS
+FastForwardHookProc

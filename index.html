@@ -1196,6 +1196,141 @@
       cursor: pointer;
       flex-shrink: 0;
     }
+
+    .speed-manual-row {
+      display: flex;
+      align-items: stretch;
+      gap: 7px;
+      width: 100%;
+    }
+
+    .speed-input-wrap {
+      display: inline-flex;
+      align-items: center;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 9px;
+      gap: 4px;
+      width: 98px;
+      flex-shrink: 0;
+    }
+
+    .speed-input-wrap:focus-within {
+      border-color: var(--glow-border);
+      box-shadow: var(--glow);
+    }
+
+    .speed-num-input {
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text-main);
+      font-size: 13px;
+      font-weight: 700;
+      outline: none;
+      padding: 7px 0;
+      text-align: center;
+      user-select: text;
+    }
+
+    .btn-speed-toggle {
+      flex: 1;
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      color: var(--text-main);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.12s ease;
+    }
+
+    .btn-speed-toggle:hover:not(:disabled) {
+      border-color: var(--glow-border);
+      box-shadow: var(--glow);
+    }
+
+    .btn-speed-toggle.is-on {
+      background: linear-gradient(135deg, #2563eb, #0284c7);
+      color: #ffffff;
+      border-color: #60a5fa;
+      box-shadow: 0 0 12px rgba(37, 99, 235, 0.45);
+    }
+
+    .btn-speed-toggle:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .bind-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11.5px;
+    }
+
+    .bind-label {
+      color: var(--text-muted);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .bind-btn-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .btn-bind-capture {
+      padding: 4px 9px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      color: var(--text-main);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      max-width: 155px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      transition: all 0.12s ease;
+    }
+
+    .btn-bind-capture:hover {
+      border-color: var(--glow-border);
+    }
+
+    .btn-bind-capture.recording {
+      border-color: #facc15;
+      background: rgba(250, 204, 21, 0.14);
+      color: #facc15;
+    }
+
+    .btn-bind-clear {
+      padding: 4px 6px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-base);
+      color: var(--text-muted);
+      font-size: 10.5px;
+      font-weight: 700;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .btn-bind-clear:hover {
+      color: #ef4444;
+      border-color: rgba(239, 68, 68, 0.45);
+    }
   </style>
 </head>
 <body>
@@ -1270,9 +1405,10 @@
       </div>
 
       <div class="detail-layout">
-        <!-- LEFT COLUMN: PLAY, CLOUD SAVE, & PATCH BAHASA INDONESIA -->
+        <!-- LEFT COLUMN: PLAY, CLOUD SAVE, SPEED CONTROL (LOCAL ONLY), & PATCH BAHASA INDONESIA -->
         <div class="detail-left-col">
           <div class="detail-card" id="detailMainCard"></div>
+          <div class="detail-card" id="detailSpeedCard" style="display:none;"></div>
           <div class="detail-card" id="detailPatchCard"></div>
         </div>
 
@@ -1498,6 +1634,14 @@
           <button class="icon-btn" type="button" style="flex-shrink:0;" onclick="pickLocalSaveFolder()">📂 Folder</button>
         </div>
       </div>
+
+      <label class="setting-row" style="margin:6px 0 8px;padding:10px 12px;">
+        <div class="setting-info">
+          <div class="setting-title" style="font-size:12.5px;">⚡ Aktifkan Fitur Fast-Forward (Khusus Game Offline Ini)</div>
+          <div class="setting-desc">Input kecepatan manual + atur tombol toggle Keyboard / Stick (misal L3/R3) khusus saat game ini berjalan.</div>
+        </div>
+        <input type="checkbox" id="chkLocalSpeedEnabled" class="setting-check" />
+      </label>
 
       <div id="localDetectBanner" style="display:none;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-base);font-size:11.5px;color:var(--text-muted);margin-top:4px;line-height:1.4;"></div>
 
@@ -1921,8 +2065,12 @@
           patchIconHtml = `<span class="patch-status-icon none" title="Patch Bahasa Indonesia Tidak Tersedia">–</span>`;
         }
 
+        const curSpd = Number(g.speed_current || 1);
+        const speedPillTag = (g.is_local && isRun && g.speed_enabled && Math.abs(curSpd - 1) > 0.04)
+          ? ` • ⚡ ${curSpd}x`
+          : "";
         const runPillHtml = isRun
-          ? `<span class="badge-patched-pill" style="background:rgba(37,99,235,0.92);border-color:#60a5fa;"><span class="running-dot"></span> RUNNING</span>`
+          ? `<span class="badge-patched-pill" style="background:rgba(37,99,235,0.92);border-color:#60a5fa;"><span class="running-dot"></span> RUNNING${speedPillTag}</span>`
           : (isUp ? `<span class="badge-patched-pill" style="background:rgba(2,132,199,0.92);border-color:#38bdf8;"><span class="running-dot"></span> CLOUD SYNC</span>` : "");
 
         const ownerBadgeLabel = g.is_local ? "💾 Game Lokal" : g.owner_account;
@@ -1934,7 +2082,7 @@
                 class="poster-img"
                 decoding="sync"
                 src="${g.cover_src || ('/api/cover/' + g.appid)}"
-                onerror="this.onerror=null; this.src='https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.appid}/header.jpg';"
+                onerror="this.onerror=null; this.src='/api/cover/${g.appid}?fallback=1';"
                 alt="${g.name}"
               />
               <div class="badges-top-left">
@@ -2059,6 +2207,19 @@
     }
 
     function closeGamePage() {
+      if (recordingKbAppId) {
+        recordingKbAppId = null;
+        stopKeyboardCaptureListeners();
+      }
+      if (recordingPadAppId) {
+        const prevAid = recordingPadAppId;
+        recordingPadAppId = null;
+        fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: prevAid, action: "cancel_capture_pad" })
+        }).catch(() => {});
+      }
       activeGamePageAppId = null;
       askResetAchievements(false);
       const dv = document.getElementById("gameDetailView");
@@ -2074,6 +2235,7 @@
       const aid = String(appid);
       const g = appState.games.find(x => String(x.appid) === aid);
       const mainCard = document.getElementById("detailMainCard");
+      const speedCard = document.getElementById("detailSpeedCard");
       const patchCard = document.getElementById("detailPatchCard");
       if (!g || !mainCard || !patchCard) return;
 
@@ -2088,7 +2250,7 @@
       const isUploading = Boolean(g.uploading);
       const cloudChecked = g.cloud_enabled ? "checked" : "";
       const posterPrimary = g.cover_src || (`/api/cover/${g.appid}`);
-      const posterFallback = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.appid}/header.jpg`;
+      const posterFallback = `/api/cover/${g.appid}?fallback=1`;
       const driveInfo = isInstalled
         ? `${g.drive || "-"} • ${g.size_gb ? g.size_gb + " GB" : "Terinstal"}`
         : (isLocalGame ? "File .exe Tidak Ditemukan" : "Belum Terinstal di PC ini");
@@ -2205,6 +2367,115 @@
         </div>
       `;
 
+      // Render Fast-Forward Card ONLY for Local (Non-Steam) Offline Single-Player Games
+      if (speedCard) {
+        if (!isLocalGame) {
+          speedCard.style.display = "none";
+          speedCard.innerHTML = "";
+        } else {
+          speedCard.style.display = "flex";
+          const spdEnabled = Boolean(g.speed_enabled);
+          const targetSpd = Number(g.speed_target || 2.0);
+          const curSpd = Number(g.speed_current || 1.0);
+          const isFfOn = Boolean(isRunning && (g.speed_active || Math.abs(curSpd - 1.0) > 0.04));
+          const kbBind = g.speed_kb_bind || null;
+          const padBind = g.speed_pad_bind || null;
+          const isRecKb = recordingKbAppId === aid;
+          const isRecPad = recordingPadAppId === aid;
+
+          let speedBodyHtml = "";
+          if (!spdEnabled) {
+            speedBodyHtml = `
+              <div style="font-size:11.5px;color:var(--text-muted);line-height:1.45;">
+                Nonaktif secara bawaan (tanpa menyentuh file game). Centang <strong>Aktifkan</strong> di atas untuk mengatur kecepatan manual &amp; tombol toggle khusus game lokal ini.
+              </div>
+            `;
+          } else {
+            const toggleBtnLabel = !isRunning
+              ? `Menunggu Game Dibuka (${targetSpd}x)`
+              : (isFfOn ? `⏹ Matikan • Aktif ${curSpd}x` : `▶ Nyalakan (${targetSpd}x)`);
+
+            const kbBtnText = isRecKb
+              ? "Tekan tombol... (Esc)"
+              : (kbBind && kbBind.label ? kbBind.label : "Atur Tombol");
+
+            const padBtnText = isRecPad
+              ? "Tekan di Stick..."
+              : (padBind && padBind.label ? padBind.label : "Atur Stick (L3/R3)");
+
+            speedBodyHtml = `
+              <div class="speed-manual-row">
+                <div class="speed-input-wrap" title="Ketik angka kecepatan manual (contoh: 2, 2.5, 4, 6)">
+                  <input
+                    type="number"
+                    id="speedManualInput"
+                    class="speed-num-input"
+                    min="0.2"
+                    max="20"
+                    step="0.5"
+                    value="${targetSpd}"
+                    onchange="saveManualSpeedTarget('${g.appid}', this.value)"
+                    onkeydown="if(event.key==='Enter'){this.blur();}"
+                  />
+                  <span style="font-size:11.5px;font-weight:800;color:var(--text-muted);">x</span>
+                </div>
+                <button
+                  type="button"
+                  class="btn-speed-toggle ${isFfOn ? 'is-on' : ''}"
+                  ${!isRunning ? "disabled" : ""}
+                  onclick="toggleLocalSpeedActiveNow('${g.appid}')"
+                >${toggleBtnLabel}</button>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:6px;padding-top:7px;border-top:1px solid var(--border);">
+                <div class="bind-row">
+                  <span class="bind-label">⌨ Toggle Keyboard</span>
+                  <div class="bind-btn-group">
+                    <button
+                      type="button"
+                      class="btn-bind-capture ${isRecKb ? 'recording' : ''}"
+                      title="Klik lalu tekan tombol keyboard pilihan Anda untuk On/Off Fast-Forward"
+                      onclick="startRecordKeyboardBind('${g.appid}')"
+                    >${kbBtnText}</button>
+                    ${kbBind ? `<button type="button" class="btn-bind-clear" title="Hapus tombol keyboard" onclick="clearSpeedBind('${g.appid}', 'kb')">✕</button>` : ''}
+                  </div>
+                </div>
+
+                <div class="bind-row">
+                  <span class="bind-label">🎮 Toggle Stick</span>
+                  <div class="bind-btn-group">
+                    <button
+                      type="button"
+                      class="btn-bind-capture ${isRecPad ? 'recording' : ''}"
+                      title="Klik lalu tekan tombol di Stick/Controller (misal L3, R3, Select, atau L1+R3)"
+                      onclick="startRecordPadBind('${g.appid}')"
+                    >${padBtnText}</button>
+                    ${padBind ? `<button type="button" class="btn-bind-clear" title="Hapus tombol stick" onclick="clearSpeedBind('${g.appid}', 'pad')">✕</button>` : ''}
+                  </div>
+                </div>
+              </div>
+            `;
+          }
+
+          speedCard.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+              <div style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:700;color:var(--text-main);">
+                <span>⚡ Fast-Forward (Offline)</span>
+              </div>
+              <label class="cloud-check-row" style="font-size:12px;color:var(--text-main);">
+                <input
+                  type="checkbox"
+                  ${spdEnabled ? "checked" : ""}
+                  onchange="toggleLocalSpeedEnable('${g.appid}', this.checked)"
+                />
+                <span>Aktifkan</span>
+              </label>
+            </div>
+            ${speedBodyHtml}
+          `;
+        }
+      }
+
       const pStatus = g.patch_status || "none";
       const hasUpdate = Boolean(g.patch_has_update);
       const hasLocal = Boolean(g.patch_has_local);
@@ -2301,6 +2572,7 @@
         if (!data || !data.ok) return;
         const runSet = new Set((data.running_appids || []).map(String));
         const upSet = new Set((data.uploading_appids || []).map(String));
+        const activeSpeeds = data.active_speeds || {};
         const lastUploads = data.last_uploads || {};
         let needRefresh = false;
 
@@ -2310,6 +2582,24 @@
           let nowUp = upSet.has(aid);
           const wasRun = Boolean(g.running);
           const wasUp = Boolean(g.uploading);
+
+          if (g.is_local && nowRun && activeSpeeds[aid]) {
+            const spInfo = activeSpeeds[aid];
+            const prevSpd = Number(g.speed_current || 1.0);
+            const prevAct = Boolean(g.speed_active);
+            const nextSpd = Number(spInfo.speed || 1.0);
+            const nextAct = Boolean(spInfo.active);
+            g.speed_current = nextSpd;
+            g.speed_active = nextAct;
+            if (spInfo.target) g.speed_target = Number(spInfo.target);
+            const typingSpeed = document.activeElement && document.activeElement.id === "speedManualInput";
+            if ((Math.abs(prevSpd - nextSpd) > 0.02 || prevAct !== nextAct) && activeGamePageAppId === aid && !typingSpeed && !recordingKbAppId && !recordingPadAppId) {
+              renderGameDetailLeftColumn(aid);
+            }
+          } else if (g.is_local && !nowRun) {
+            g.speed_current = 1.0;
+            g.speed_active = false;
+          }
 
           // When game just stopped running and Cloud Save is checked, immediately transition to Upload to Cloud
           if (wasRun && !nowRun && g.cloud_enabled) {
@@ -2762,6 +3052,8 @@
       document.getElementById("localAppIdInput").value = existing ? existing.appid : "";
       document.getElementById("localNameInput").value = existing ? existing.name : "";
       document.getElementById("localSaveDirInput").value = existing ? (existing.save_dir || "") : "";
+      const chkSpd = document.getElementById("chkLocalSpeedEnabled");
+      if (chkSpd) chkSpd.checked = Boolean(existing && existing.speed_enabled);
       document.getElementById("localGameModalTitle").textContent = existing
         ? `Pengaturan Game Lokal: ${existing.name}`
         : "Tambah Game Lokal (Non-Steam)";
@@ -2873,6 +3165,8 @@
       const name = document.getElementById("localNameInput").value.trim();
       const save_dir = document.getElementById("localSaveDirInput").value.trim();
       const old_appid = document.getElementById("localOldAppIdInput").value.trim();
+      const chkSpd = document.getElementById("chkLocalSpeedEnabled");
+      const speed_enabled = Boolean(chkSpd && chkSpd.checked);
 
       if (!exe_path) {
         showToast("Pilih file .exe atau masukkan folder game terlebih dahulu!");
@@ -2887,7 +3181,7 @@
         const res = await fetch("/api/save_local_game", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ exe_path, appid_or_url, name, save_dir, old_appid })
+          body: JSON.stringify({ exe_path, appid_or_url, name, save_dir, old_appid, speed_enabled })
         });
         const data = await res.json();
         showToast(data.message || (data.ok ? "Game lokal disimpan!" : "Gagal menyimpan game lokal."), 4500);
@@ -2939,6 +3233,269 @@
         }
       } catch (e) {
         showToast("Gagal membuka folder.");
+      }
+    }
+
+    let recordingKbAppId = null;
+    let recordingPadAppId = null;
+    let pendingModifierVk = null;
+    let pendingModifierLabel = "";
+
+    const VK_PRETTY_NAMES = {
+      8: "Backspace", 9: "Tab", 13: "Enter", 19: "Pause", 20: "CapsLock",
+      32: "Space", 33: "PageUp", 34: "PageDown", 35: "End", 36: "Home",
+      37: "Left", 38: "Up", 39: "Right", 40: "Down", 45: "Insert", 46: "Delete",
+      96: "Numpad 0", 97: "Numpad 1", 98: "Numpad 2", 99: "Numpad 3", 100: "Numpad 4",
+      101: "Numpad 5", 102: "Numpad 6", 103: "Numpad 7", 104: "Numpad 8", 105: "Numpad 9",
+      106: "Numpad *", 107: "Numpad +", 109: "Numpad -", 110: "Numpad .", 111: "Numpad /",
+      144: "NumLock", 145: "ScrollLock",
+      160: "Left Shift", 161: "Right Shift", 162: "Left Ctrl", 163: "Right Ctrl",
+      164: "Left Alt", 165: "Right Alt",
+      186: ";", 187: "=", 188: ",", 189: "-", 190: ".", 191: "/", 192: "~ (Backtick)",
+      219: "[", 220: "\\", 221: "]", 222: "'"
+    };
+
+    function formatVkName(e) {
+      const kc = Number(e.keyCode || 0);
+      if (kc === 16) return e.location === 2 ? { vk: 161, name: "Right Shift" } : { vk: 160, name: "Left Shift" };
+      if (kc === 17) return e.location === 2 ? { vk: 163, name: "Right Ctrl" } : { vk: 162, name: "Left Ctrl" };
+      if (kc === 18) return e.location === 2 ? { vk: 165, name: "Right Alt" } : { vk: 164, name: "Left Alt" };
+      if (VK_PRETTY_NAMES[kc]) return { vk: kc, name: VK_PRETTY_NAMES[kc] };
+      if (kc >= 112 && kc <= 123) return { vk: kc, name: `F${kc - 111}` };
+      if ((kc >= 65 && kc <= 90) || (kc >= 48 && kc <= 57)) return { vk: kc, name: String.fromCharCode(kc) };
+      return { vk: kc, name: (e.key && e.key.length === 1) ? e.key.toUpperCase() : `Key ${kc}` };
+    }
+
+    async function saveSpeedBindToServer(appid, action, fieldPayload) {
+      const aid = String(appid);
+      try {
+        const res = await fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: aid, action, ...fieldPayload })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          const gObj = appState.games.find(x => String(x.appid) === aid);
+          if (gObj) {
+            gObj.speed_kb_bind = data.speed_kb_bind || null;
+            gObj.speed_pad_bind = data.speed_pad_bind || null;
+          }
+          if (data.message) showToast(data.message, 2800);
+        }
+      } catch (err) {
+        showToast("Gagal menyimpan pengaturan tombol.");
+      }
+      if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+    }
+
+    function stopKeyboardCaptureListeners() {
+      window.removeEventListener("keydown", onCaptureKeyDown, true);
+      window.removeEventListener("keyup", onCaptureKeyUp, true);
+      pendingModifierVk = null;
+      pendingModifierLabel = "";
+    }
+
+    function onCaptureKeyDown(e) {
+      if (!recordingKbAppId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const aid = recordingKbAppId;
+      const kc = Number(e.keyCode || 0);
+      if (kc === 27) { // Escape cancels
+        recordingKbAppId = null;
+        stopKeyboardCaptureListeners();
+        if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+        return;
+      }
+      if (!kc || kc === 91 || kc === 92) return;
+
+      if (kc === 16 || kc === 17 || kc === 18) {
+        const mod = formatVkName(e);
+        pendingModifierVk = mod.vk;
+        pendingModifierLabel = mod.name;
+        return;
+      }
+
+      const main = formatVkName(e);
+      const vks = [];
+      const labels = [];
+      if (e.ctrlKey) { vks.push(17); labels.push("Ctrl"); }
+      if (e.altKey) { vks.push(18); labels.push("Alt"); }
+      if (e.shiftKey) { vks.push(16); labels.push("Shift"); }
+      vks.push(main.vk);
+      labels.push(main.name);
+
+      recordingKbAppId = null;
+      stopKeyboardCaptureListeners();
+      saveSpeedBindToServer(aid, "set_kb_bind", {
+        kb_bind: { vks, label: labels.join(" + ") }
+      });
+    }
+
+    function onCaptureKeyUp(e) {
+      if (!recordingKbAppId) return;
+      const kc = Number(e.keyCode || 0);
+      if ((kc === 16 || kc === 17 || kc === 18) && pendingModifierVk) {
+        e.preventDefault();
+        e.stopPropagation();
+        const aid = recordingKbAppId;
+        const vk = pendingModifierVk;
+        const lbl = pendingModifierLabel;
+        recordingKbAppId = null;
+        stopKeyboardCaptureListeners();
+        saveSpeedBindToServer(aid, "set_kb_bind", {
+          kb_bind: { vks: [vk], label: lbl }
+        });
+      }
+    }
+
+    function startRecordKeyboardBind(appid) {
+      const aid = String(appid);
+      if (recordingKbAppId === aid) {
+        recordingKbAppId = null;
+        stopKeyboardCaptureListeners();
+        renderGameDetailLeftColumn(aid);
+        return;
+      }
+      recordingKbAppId = aid;
+      pendingModifierVk = null;
+      pendingModifierLabel = "";
+      window.addEventListener("keydown", onCaptureKeyDown, true);
+      window.addEventListener("keyup", onCaptureKeyUp, true);
+      renderGameDetailLeftColumn(aid);
+    }
+
+    async function startRecordPadBind(appid) {
+      const aid = String(appid);
+      if (recordingPadAppId === aid) {
+        recordingPadAppId = null;
+        fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: aid, action: "cancel_capture_pad" })
+        }).catch(() => {});
+        renderGameDetailLeftColumn(aid);
+        return;
+      }
+      recordingPadAppId = aid;
+      renderGameDetailLeftColumn(aid);
+      showToast("🎮 Tekan tombol pilihan di Stick/Controller Anda sekarang (misal L3 atau R3)...", 6000);
+      try {
+        const res = await fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: aid, action: "capture_pad" })
+        });
+        const data = await res.json();
+        recordingPadAppId = null;
+        if (data && data.ok) {
+          const gObj = appState.games.find(x => String(x.appid) === aid);
+          if (gObj) gObj.speed_pad_bind = data.speed_pad_bind || null;
+          showToast(data.message || "Tombol Stick tersimpan!", 3200);
+        } else if (data && data.message) {
+          showToast(data.message, 3500);
+        }
+      } catch (err) {
+        recordingPadAppId = null;
+        showToast("Gagal merekam tombol stick.");
+      }
+      if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+    }
+
+    function clearSpeedBind(appid, kind) {
+      const aid = String(appid);
+      if (kind === "kb") {
+        saveSpeedBindToServer(aid, "set_kb_bind", { kb_bind: null });
+      } else {
+        saveSpeedBindToServer(aid, "set_pad_bind", { pad_bind: null });
+      }
+    }
+
+    async function toggleLocalSpeedEnable(appid, enabled) {
+      const aid = String(appid);
+      const gObj = appState.games.find(x => String(x.appid) === aid);
+      try {
+        const res = await fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: aid, action: "toggle_enable", enabled: Boolean(enabled) })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          if (gObj) {
+            gObj.speed_enabled = Boolean(data.speed_enabled);
+            gObj.speed_current = Number(data.speed_current || 1.0);
+            gObj.speed_active = Boolean(data.speed_active);
+          }
+          showToast(data.message || "Pengaturan Fast-Forward diperbarui.", 3500);
+        } else {
+          showToast((data && data.message) || "Gagal mengubah pengaturan Fast-Forward.", 4000);
+        }
+        await refreshState();
+        if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+      } catch (e) {
+        showToast("Gagal menghubungi server lokal.");
+        if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+      }
+    }
+
+    async function saveManualSpeedTarget(appid, rawVal) {
+      const aid = String(appid);
+      let num = parseFloat(String(rawVal).replace(",", "."));
+      if (isNaN(num) || num < 0.2) num = 0.2;
+      if (num > 20) num = 20;
+      num = Math.round(num * 100) / 100;
+      const gObj = appState.games.find(x => String(x.appid) === aid);
+      if (gObj) gObj.speed_target = num;
+      try {
+        const res = await fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: aid, action: "set_target", speed_target: num })
+        });
+        const data = await res.json();
+        if (data && data.ok && gObj) {
+          gObj.speed_target = Number(data.speed_target || num);
+          gObj.speed_current = Number(data.speed_current || 1.0);
+          gObj.speed_active = Boolean(data.speed_active);
+          if (data.message) showToast(data.message, 2200);
+        }
+      } catch (e) {
+        showToast("Gagal menyimpan angka kecepatan.");
+      }
+      if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+    }
+
+    async function toggleLocalSpeedActiveNow(appid) {
+      const aid = String(appid);
+      const inp = document.getElementById("speedManualInput");
+      const gObj = appState.games.find(x => String(x.appid) === aid);
+      if (inp && gObj) {
+        let typed = parseFloat(String(inp.value).replace(",", "."));
+        if (!isNaN(typed) && typed >= 0.2 && typed <= 20 && Math.abs(typed - Number(gObj.speed_target || 2.0)) > 0.01) {
+          await saveManualSpeedTarget(aid, typed);
+        }
+      }
+      try {
+        const res = await fetch("/api/local_speed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: aid, action: "toggle_active" })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          if (gObj) {
+            gObj.speed_current = Number(data.speed_current || 1.0);
+            gObj.speed_active = Boolean(data.speed_active);
+          }
+          showToast(data.message || "Status Fast-Forward diubah.", 2600);
+        } else {
+          showToast((data && data.message) || "Gagal mengubah status Fast-Forward.", 3500);
+        }
+        if (activeGamePageAppId === aid) renderGameDetailLeftColumn(aid);
+      } catch (e) {
+        showToast("Gagal menghubungi server lokal.");
       }
     }
 
