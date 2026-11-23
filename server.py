@@ -61,6 +61,11 @@ PATCHES_META_TS = 0
 PATCHES_FETCHING = False
 LAST_UI_ACTIVITY_TS = time.time()
 TRAY_ICON = None
+LOCAL_GAME_PROCS = {}
+SCHEMA_FETCHING = set()
+COVER_FETCHING = set()
+PROC_SNAPSHOT_CACHE = {"ts": 0.0, "names": set()}
+LOCAL_DATA_ROOT = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "SteamSwitcher")
 
 def _load_asset_bytes(filename):
     for folder in (ASSET_DIR, BASE_DIR):
@@ -361,79 +366,450 @@ def _unwrap_vdf_typed(obj):
         return {k: _unwrap_vdf_typed(v) for k, v in obj.items()}
     return obj
 
-def parse_game_achievement_schema(steam_path, appid):
-    aid_s = str(appid)
-    if aid_s in SCHEMA_CACHE:
-        return SCHEMA_CACHE[aid_s]
+def load_local_games():
+    data = _reg_read_json("LocalGames")
+    if not isinstance(data, dict):
+        return {}
+    clean = {}
+    for k, v in data.items():
+        aid = str(k).strip()
+        if aid and isinstance(v, dict):
+            clean[aid] = {
+                "appid": aid,
+                "name": str(v.get("name") or f"App {aid}"),
+                "exe_path": os.path.normpath(v["exe_path"]) if v.get("exe_path") else "",
+                "install_dir": os.path.normpath(v["install_dir"]) if v.get("install_dir") else "",
+                "save_dir": os.path.normpath(v["save_dir"]) if v.get("save_dir") else "",
+                "emu_type": str(v.get("emu_type") or ""),
+                "added_at": int(v.get("added_at") or 0),
+                "last_played": int(v.get("last_played") or 0),
+            }
+    return clean
 
-    schema_path = os.path.join(steam_path, "appcache", "stats", f"UserGameStatsSchema_{aid_s}.bin")
-    if not os.path.exists(schema_path):
+def save_local_games(data):
+    if isinstance(data, dict):
+        _reg_write_json("LocalGames", data)
+
+def _get_cached_schema_json_path(appid):
+    return os.path.join(LOCAL_DATA_ROOT, "schemas", f"{appid}.json")
+
+def fetch_remote_achievement_schema(appid):
+    """Fetch official Steam achievement schema (including internal API names, titles, descriptions, icons, and bit keys) without owning the game."""
+    aid_s = str(appid).strip()
+    if not aid_s.isdigit():
         return []
-
-    achievements = []
+    url = f"https://api.steampowered.com/IPlayerService/GetGameAchievements/v1/?appid={aid_s}&language=english"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
     try:
-        raw = open(schema_path, "rb").read()
-        parsed_typed, _ = _parse_vdf_bin_typed(raw)
-        parsed = _unwrap_vdf_typed(parsed_typed)
-        app_block = parsed.get(aid_s) or next(iter(parsed.values()), {})
-        stats_block = app_block.get("stats", {}) if isinstance(app_block, dict) else {}
-
-        for stat_id, stat_def in stats_block.items():
-            if not isinstance(stat_def, dict):
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        raw_list = (payload.get("response") or {}).get("achievements") or []
+        achievements = []
+        for idx, item in enumerate(raw_list):
+            if not isinstance(item, dict):
                 continue
-            stype = str(stat_def.get("type", "")).upper()
-            bits_block = stat_def.get("bits", {})
-            if stype not in ("ACHIEVEMENTS", "4") and not bits_block:
-                continue
-            if not isinstance(bits_block, dict):
-                continue
-            for bit_key, bit_def in bits_block.items():
-                if not isinstance(bit_def, dict) or not str(bit_key).isdigit():
-                    continue
-                bit_num = int(bit_key)
-                disp = bit_def.get("display", {}) if isinstance(bit_def.get("display"), dict) else {}
-                name_obj = disp.get("name", {})
-                desc_obj = disp.get("desc") or disp.get("description") or {}
-                title = (
-                    name_obj.get("english") or next(iter(name_obj.values()), "")
-                    if isinstance(name_obj, dict) else str(name_obj or "")
-                )
-                desc = (
-                    desc_obj.get("english") or next(iter(desc_obj.values()), "")
-                    if isinstance(desc_obj, dict) else str(desc_obj or "")
-                )
-                icon_fn = str(disp.get("icon", "") or "")
-                icon_gray_fn = str(disp.get("icon_gray", "") or icon_fn)
-                hidden_flag = str(disp.get("hidden", "0")) == "1"
-                achievements.append({
-                    "key": f"{stat_id}:{bit_num}",
-                    "stat_id": str(stat_id),
-                    "bit_id": bit_num,
-                    "api_name": str(bit_def.get("name", f"ACH_{stat_id}_{bit_num}")),
-                    "title": title or str(bit_def.get("name", f"Achievement #{len(achievements)+1}")),
-                    "description": desc,
-                    "hidden": hidden_flag,
-                    "icon_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_fn}" if icon_fn else "",
-                    "icon_gray_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_gray_fn}" if icon_gray_fn else ""
-                })
+            internal_key = item.get("internal_key")
+            if isinstance(internal_key, int) and internal_key >= 0:
+                stat_id = str(internal_key >> 8)
+                bit_num = int(internal_key & 0xFF)
+            else:
+                stat_id = str((idx // 32) + 1)
+                bit_num = idx % 32
+            api_name = str(item.get("internal_name") or f"ACH_{stat_id}_{bit_num}")
+            title = str(item.get("localized_name") or api_name)
+            desc = str(item.get("localized_desc") or "")
+            icon_fn = str(item.get("icon") or "")
+            icon_gray_fn = str(item.get("icon_gray") or icon_fn)
+            hidden_flag = bool(item.get("hidden", False))
+            achievements.append({
+                "key": f"{stat_id}:{bit_num}",
+                "stat_id": stat_id,
+                "bit_id": bit_num,
+                "api_name": api_name,
+                "title": title,
+                "description": desc,
+                "hidden": hidden_flag,
+                "icon_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_fn}" if icon_fn else "",
+                "icon_gray_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_gray_fn}" if icon_gray_fn else ""
+            })
         achievements.sort(key=lambda x: (int(x["stat_id"]) if x["stat_id"].isdigit() else 0, x["bit_id"]))
-        SCHEMA_CACHE[aid_s] = achievements
+        cache_fp = _get_cached_schema_json_path(aid_s)
+        os.makedirs(os.path.dirname(cache_fp), exist_ok=True)
+        with open(cache_fp, "w", encoding="utf-8") as f:
+            json.dump({"fetched_at": int(time.time()), "achievements": achievements}, f, ensure_ascii=False)
+        if achievements:
+            SCHEMA_CACHE[aid_s] = achievements
+        return achievements
     except Exception:
         return []
-    return achievements
+
+def parse_game_achievement_schema(steam_path, appid, allow_remote=False):
+    aid_s = str(appid)
+    if aid_s in SCHEMA_CACHE and SCHEMA_CACHE[aid_s]:
+        return SCHEMA_CACHE[aid_s]
+
+    schema_path = os.path.join(steam_path, "appcache", "stats", f"UserGameStatsSchema_{aid_s}.bin") if steam_path else ""
+    if schema_path and os.path.exists(schema_path):
+        achievements = []
+        try:
+            raw = open(schema_path, "rb").read()
+            parsed_typed, _ = _parse_vdf_bin_typed(raw)
+            parsed = _unwrap_vdf_typed(parsed_typed)
+            app_block = parsed.get(aid_s) or next(iter(parsed.values()), {})
+            stats_block = app_block.get("stats", {}) if isinstance(app_block, dict) else {}
+
+            for stat_id, stat_def in stats_block.items():
+                if not isinstance(stat_def, dict):
+                    continue
+                stype = str(stat_def.get("type", "")).upper()
+                bits_block = stat_def.get("bits", {})
+                if stype not in ("ACHIEVEMENTS", "4") and not bits_block:
+                    continue
+                if not isinstance(bits_block, dict):
+                    continue
+                for bit_key, bit_def in bits_block.items():
+                    if not isinstance(bit_def, dict) or not str(bit_key).isdigit():
+                        continue
+                    bit_num = int(bit_key)
+                    disp = bit_def.get("display", {}) if isinstance(bit_def.get("display"), dict) else {}
+                    name_obj = disp.get("name", {})
+                    desc_obj = disp.get("desc") or disp.get("description") or {}
+                    title = (
+                        name_obj.get("english") or next(iter(name_obj.values()), "")
+                        if isinstance(name_obj, dict) else str(name_obj or "")
+                    )
+                    desc = (
+                        desc_obj.get("english") or next(iter(desc_obj.values()), "")
+                        if isinstance(desc_obj, dict) else str(desc_obj or "")
+                    )
+                    icon_fn = str(disp.get("icon", "") or "")
+                    icon_gray_fn = str(disp.get("icon_gray", "") or icon_fn)
+                    hidden_flag = str(disp.get("hidden", "0")) == "1"
+                    achievements.append({
+                        "key": f"{stat_id}:{bit_num}",
+                        "stat_id": str(stat_id),
+                        "bit_id": bit_num,
+                        "api_name": str(bit_def.get("name", f"ACH_{stat_id}_{bit_num}")),
+                        "title": title or str(bit_def.get("name", f"Achievement #{len(achievements)+1}")),
+                        "description": desc,
+                        "hidden": hidden_flag,
+                        "icon_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_fn}" if icon_fn else "",
+                        "icon_gray_url": f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{aid_s}/{icon_gray_fn}" if icon_gray_fn else ""
+                    })
+            achievements.sort(key=lambda x: (int(x["stat_id"]) if x["stat_id"].isdigit() else 0, x["bit_id"]))
+            if achievements:
+                SCHEMA_CACHE[aid_s] = achievements
+                return achievements
+        except Exception:
+            pass
+
+    # Fallback 1: Local cached JSON schema from Steam Web API
+    cache_fp = _get_cached_schema_json_path(aid_s)
+    if os.path.exists(cache_fp):
+        try:
+            cached_obj = json.loads(open(cache_fp, "r", encoding="utf-8", errors="ignore").read())
+            c_list = cached_obj.get("achievements", []) if isinstance(cached_obj, dict) else []
+            if isinstance(c_list, list) and c_list:
+                SCHEMA_CACHE[aid_s] = c_list
+                return c_list
+            # Avoid repeated fetches if confirmed 0 achievements within last 12h
+            if isinstance(cached_obj, dict) and (time.time() - int(cached_obj.get("fetched_at", 0))) < 43200:
+                return []
+        except Exception:
+            pass
+
+    # Fallback 2: Fetch from public Steam Web API on-demand
+    if allow_remote:
+        return fetch_remote_achievement_schema(aid_s)
+
+    return []
+
+def get_emulator_achievement_candidates(appid, install_dir=""):
+    """Return list of (emu_kind, file_path) for known Steam emulators (RUNE, CODEX, Goldberg, GSE, FLT, OnlineFix, Tenoke, SKIDROW)."""
+    aid_s = str(appid).strip()
+    sys_drive = os.environ.get("SystemDrive", "C:")
+    pub_docs = os.path.join(os.environ.get("PUBLIC", os.path.join(sys_drive, "Users", "Public")), "Documents")
+    appdata = os.environ.get("APPDATA", os.path.expanduser(r"~\AppData\Roaming"))
+    localapp = os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
+
+    if not install_dir:
+        lg = load_local_games().get(aid_s)
+        if lg and lg.get("install_dir"):
+            install_dir = lg["install_dir"]
+
+    raw_cands = [
+        ("rune_ini", os.path.join(pub_docs, "Steam", "RUNE", aid_s, "achievements.ini")),
+        ("rune_ini", os.path.join(sys_drive, "\\Users\\Public\\Documents\\Steam\\RUNE", aid_s, "achievements.ini")),
+        ("rune_ini", os.path.join(appdata, "Steam", "RUNE", aid_s, "achievements.ini")),
+        ("codex_ini", os.path.join(pub_docs, "Steam", "CODEX", aid_s, "achievements.ini")),
+        ("codex_ini", os.path.join(sys_drive, "\\Users\\Public\\Documents\\Steam\\CODEX", aid_s, "achievements.ini")),
+        ("codex_ini", os.path.join(appdata, "Steam", "CODEX", aid_s, "achievements.ini")),
+        ("goldberg_json", os.path.join(appdata, "Goldberg SteamEmu Saves", aid_s, "achievements.json")),
+        ("goldberg_json", os.path.join(appdata, "GSE Saves", aid_s, "achievements.json")),
+        ("flt_ini", os.path.join(appdata, "FLT", aid_s, "stats", "achievements.ini")),
+        ("onlinefix_ini", os.path.join(pub_docs, "OnlineFix", aid_s, "Stats", "Achievements.ini")),
+        ("skidrow_ini", os.path.join(localapp, "SKIDROW", aid_s, "Storage", "achievements.ini")),
+        ("sse_ini", os.path.join(appdata, "SmartSteamEmu", aid_s, "achievements.ini")),
+    ]
+    if install_dir and os.path.isdir(install_dir):
+        raw_cands.extend([
+            ("tenoke_ini", os.path.join(install_dir, "SteamData", "user_stats.ini")),
+            ("goldberg_json", os.path.join(install_dir, "steam_settings", "settings", "achievements.json")),
+            ("codex_ini", os.path.join(install_dir, "Profile", "Stats", "Achievements.ini")),
+            ("codex_ini", os.path.join(install_dir, "Profile", "VALVE", "Stats", "Achievements.ini")),
+        ])
+
+    seen = set()
+    unique = []
+    for kind, fp in raw_cands:
+        norm = os.path.normpath(fp)
+        low = norm.lower()
+        if low not in seen:
+            seen.add(low)
+            unique.append((kind, norm))
+    return unique
+
+def _parse_emulator_achievement_file(kind, fp):
+    """Parse an emulator achievements.ini / achievements.json file into {api_name: unlock_timestamp}."""
+    unlocked_by_api = {}
+    if not os.path.isfile(fp):
+        return unlocked_by_api
+    try:
+        file_mtime = int(os.path.getmtime(fp)) or int(time.time())
+    except Exception:
+        file_mtime = int(time.time())
+
+    try:
+        raw_txt = open(fp, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return unlocked_by_api
+
+    if kind == "goldberg_json" or fp.lower().endswith(".json"):
+        try:
+            obj = json.loads(raw_txt)
+            if isinstance(obj, dict):
+                for api_name, info in obj.items():
+                    if isinstance(info, dict):
+                        if info.get("earned") in (True, 1, "1", "true") or info.get("achieved") in (True, 1, "1", "true") or info.get("unlocked") in (True, 1, "1", "true"):
+                            ts = int(info.get("earned_time") or info.get("unlock_time") or info.get("UnlockTime") or info.get("time") or file_mtime)
+                            unlocked_by_api[str(api_name).strip()] = ts if ts > 0 else file_mtime
+                    elif info in (True, 1, "1", "true"):
+                        unlocked_by_api[str(api_name).strip()] = file_mtime
+            elif isinstance(obj, list):
+                for entry in obj:
+                    if isinstance(entry, dict):
+                        aname = str(entry.get("name") or entry.get("id") or "").strip()
+                        if aname and (entry.get("achieved") in (True, 1, "1", "true") or entry.get("earned") in (True, 1, "1", "true")):
+                            ts = int(entry.get("UnlockTime") or entry.get("earned_time") or file_mtime)
+                            unlocked_by_api[aname] = ts if ts > 0 else file_mtime
+        except Exception:
+            pass
+        return unlocked_by_api
+
+    # Parse INI / plain-list formats (RUNE, CODEX, Tenoke, OnlineFix, FLT, ALI213, SKIDROW)
+    sections = {}
+    cur_sec = ""
+    plain_lines = []
+    for raw_line in raw_txt.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(";") or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur_sec = line[1:-1].strip()
+            sections.setdefault(cur_sec, {})
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            sections.setdefault(cur_sec, {})[k.strip()] = v.strip()
+        elif not cur_sec:
+            plain_lines.append(line)
+
+    # 1. Plain list (e.g. FLT stats/achievements.ini with one API_NAME per line)
+    if not sections and plain_lines:
+        for pl in plain_lines:
+            unlocked_by_api[pl] = file_mtime
+        return unlocked_by_api
+
+    sec_ci = {s.lower(): s for s in sections}
+
+    # 2. [SteamAchievements] index block (RUNE / CODEX)
+    sa_sec_key = sec_ci.get("steamachievements")
+    if sa_sec_key:
+        for k, v in sections[sa_sec_key].items():
+            if k.lower() == "count":
+                continue
+            cand_name = v.strip().strip('"')
+            if not cand_name:
+                continue
+            own_sec_key = sec_ci.get(cand_name.lower())
+            if own_sec_key is None:
+                unlocked_by_api[cand_name] = file_mtime
+            else:
+                own_sec = sections[own_sec_key]
+                ach_val = str(own_sec.get("Achieved") or own_sec.get("achieved") or own_sec.get("State") or own_sec.get("Unlocked") or "1").strip().lower()
+                if ach_val in ("1", "true", "yes"):
+                    ts_raw = own_sec.get("UnlockTime") or own_sec.get("unlocktime") or own_sec.get("Time") or "0"
+                    ts_i = int(ts_raw) if str(ts_raw).isdigit() and int(ts_raw) > 0 else file_mtime
+                    unlocked_by_api[own_sec_key] = ts_i
+
+    # 3. Individual [Achievement_API_Name] sections & [ACHIEVEMENTS] block (Tenoke / OnlineFix / CODEX)
+    for sec_name, kv in sections.items():
+        if not sec_name:
+            continue
+        s_low = sec_name.lower()
+        if s_low in ("steamachievements", "steamstats", "stats", "leaderboards", "settings"):
+            continue
+        if s_low in ("achievements", "achiev"):
+            for ak, av in kv.items():
+                clean_k = ak.strip().strip('"')
+                av_low = av.lower()
+                if av_low in ("1", "true", "yes") or "unlocked = true" in av_low or "unlocked=true" in av_low or "achieved = 1" in av_low:
+                    m_ts = re.search(r"time\s*=\s*(\d+)", av_low)
+                    ts_i = int(m_ts.group(1)) if (m_ts and int(m_ts.group(1)) > 0) else file_mtime
+                    unlocked_by_api[clean_k] = ts_i
+        else:
+            kv_ci = {x.lower(): y for x, y in kv.items()}
+            ach_flag = str(kv_ci.get("achieved") or kv_ci.get("unlocked") or kv_ci.get("state") or "").strip().lower()
+            if ach_flag in ("1", "true", "yes"):
+                ts_raw = str(kv_ci.get("unlocktime") or kv_ci.get("time") or kv_ci.get("timestamp") or "0").strip()
+                ts_i = int(ts_raw) if ts_raw.isdigit() and int(ts_raw) > 0 else file_mtime
+                unlocked_by_api[sec_name] = ts_i
+
+    return unlocked_by_api
+
+def read_emulator_achievements(steam_path, appid, install_dir=""):
+    """Read unlocked achievement keys and timestamps from RUNE/CODEX/Goldberg/GSE/Tenoke/OnlineFix/FLT emulator files."""
+    aid_s = str(appid)
+    cands = get_emulator_achievement_candidates(aid_s, install_dir=install_dir)
+    existing = [(kind, fp) for kind, fp in cands if os.path.isfile(fp)]
+    if not existing:
+        return {}
+
+    raw_api_unlocked = {}
+    for kind, fp in existing:
+        parsed_map = _parse_emulator_achievement_file(kind, fp)
+        for aname, ts in parsed_map.items():
+            if aname not in raw_api_unlocked or ts < raw_api_unlocked[aname]:
+                raw_api_unlocked[aname] = ts
+
+    if not raw_api_unlocked:
+        return {}
+
+    schema = parse_game_achievement_schema(steam_path, aid_s, allow_remote=True)
+    api_to_key = {}
+    for item in schema:
+        aname = str(item.get("api_name", "")).strip()
+        if aname:
+            api_to_key[aname] = item["key"]
+            api_to_key[aname.lower()] = item["key"]
+
+    unlocked = {}
+    for aname, ts in raw_api_unlocked.items():
+        matched_key = api_to_key.get(aname) or api_to_key.get(aname.lower())
+        if matched_key:
+            unlocked[matched_key] = int(ts)
+    return unlocked
+
+def apply_personal_achievements_to_emu_files(appid, personal_map, schema):
+    """Sync personal achievements back to existing RUNE/CODEX achievements.ini or Goldberg achievements.json when game is idle."""
+    aid_s = str(appid)
+    if not schema:
+        return False
+    key_to_api = {item["key"]: item["api_name"] for item in schema if item.get("api_name")}
+    unlocked_api = {}
+    for k, ts in (personal_map or {}).items():
+        if ts and int(ts) > 0 and k in key_to_api:
+            unlocked_api[key_to_api[k]] = int(ts)
+
+    wrote = False
+    for kind, fp in get_emulator_achievement_candidates(aid_s):
+        parent_dir = os.path.dirname(fp)
+        if not os.path.isfile(fp):
+            # Only create file if the emulator's appid directory already exists (e.g. Public\Documents\Steam\RUNE\625960)
+            if kind not in ("rune_ini", "codex_ini", "goldberg_json") or not os.path.isdir(parent_dir):
+                continue
+        try:
+            if kind == "goldberg_json":
+                cur_obj = {}
+                if os.path.isfile(fp):
+                    try:
+                        loaded = json.loads(open(fp, "r", encoding="utf-8", errors="ignore").read())
+                        if isinstance(loaded, dict):
+                            cur_obj = loaded
+                    except Exception:
+                        pass
+                new_obj = {}
+                for aname, val in cur_obj.items():
+                    if aname not in unlocked_api and isinstance(val, dict):
+                        val_copy = dict(val)
+                        val_copy["earned"] = False
+                        val_copy["earned_time"] = 0
+                        new_obj[aname] = val_copy
+                for aname, ts in unlocked_api.items():
+                    new_obj[aname] = {"earned": True, "earned_time": int(ts)}
+                with open(fp, "w", encoding="utf-8") as f:
+                    json.dump(new_obj, f, indent=2)
+                wrote = True
+            elif kind in ("rune_ini", "codex_ini"):
+                preserved_progress = {}
+                if os.path.isfile(fp):
+                    try:
+                        cur_txt = open(fp, "r", encoding="utf-8", errors="ignore").read()
+                        cur_sec = ""
+                        sec_map = {}
+                        for raw_l in cur_txt.splitlines():
+                            l = raw_l.strip()
+                            if l.startswith("[") and l.endswith("]"):
+                                cur_sec = l[1:-1].strip()
+                                sec_map.setdefault(cur_sec, {})
+                            elif "=" in l and cur_sec:
+                                kk, vv = l.split("=", 1)
+                                sec_map.setdefault(cur_sec, {})[kk.strip()] = vv.strip()
+                        for s_name, kv in sec_map.items():
+                            if s_name.lower() in ("steamachievements", ""):
+                                continue
+                            kv_ci = {a.lower(): b for a, b in kv.items()}
+                            if str(kv_ci.get("achieved", "0")).strip() == "0" and s_name not in unlocked_api:
+                                preserved_progress[s_name] = kv
+                    except Exception:
+                        pass
+
+                lines = ["[SteamAchievements]", f"Count={len(unlocked_api)}"]
+                sorted_unlocked = sorted(unlocked_api.items(), key=lambda x: x[1])
+                for idx, (aname, _) in enumerate(sorted_unlocked):
+                    lines.append(f"{idx:05d}={aname}")
+                lines.append("")
+                for aname, ts in sorted_unlocked:
+                    lines.append(f"[{aname}]")
+                    lines.append("Achieved=1")
+                    lines.append("CurProgress=0")
+                    lines.append("MaxProgress=0")
+                    lines.append(f"UnlockTime={int(ts)}")
+                    lines.append("")
+                for p_name, p_kv in preserved_progress.items():
+                    lines.append(f"[{p_name}]")
+                    for pk, pv in p_kv.items():
+                        lines.append(f"{pk}={pv}")
+                    lines.append("")
+                with open(fp, "w", encoding="utf-8", newline="\r\n") as f:
+                    f.write("\n".join(lines))
+                wrote = True
+        except Exception:
+            pass
+    return wrote
 
 def read_steam_user_achievements(steam_path, sid3, appid):
-    """Read unlocked achievement keys and timestamps from Steam's UserGameStats_<sid3>_<appid>.bin."""
+    """Read unlocked achievement keys and timestamps from Steam's UserGameStats_<sid3>_<appid>.bin AND any local Steam Emulator files."""
     aid_s = str(appid)
     schema = parse_game_achievement_schema(steam_path, aid_s)
     ach_stat_ids = {item["stat_id"] for item in schema}
-    stats_dir = os.path.join(steam_path, "appcache", "stats")
+    stats_dir = os.path.join(steam_path, "appcache", "stats") if steam_path else ""
     candidates = []
-    if sid3:
+    if stats_dir and sid3:
         p_main = os.path.join(stats_dir, f"UserGameStats_{sid3}_{aid_s}.bin")
         if os.path.exists(p_main):
             candidates.append(p_main)
-    if not candidates:
+    if stats_dir and not candidates:
         candidates = glob.glob(os.path.join(stats_dir, f"UserGameStats_*_{aid_s}.bin"))
 
     unlocked = {}
@@ -461,26 +837,106 @@ def read_steam_user_achievements(steam_path, sid3, appid):
                         unlocked[k] = ts
         except Exception:
             pass
+
+    emu_unlocked = read_emulator_achievements(steam_path, aid_s)
+    for k, ts in emu_unlocked.items():
+        if k not in unlocked or (ts > 0 and ts < unlocked[k]):
+            unlocked[k] = ts
+
     return unlocked
 
+def load_protected_accounts(steam_path=None):
+    """Load list of protected Steam usernames/IDs whose achievement .bin files must NEVER be overwritten."""
+    data = _reg_read_json("ProtectedAccounts")
+    if isinstance(data, list):
+        return sorted(list({str(x).strip().lower() for x in data if str(x).strip()}))
+    # Auto-seed on first run with any currently Online Steam accounts (personal accounts)
+    seeded = set()
+    sp = steam_path or get_steam_registry_info().get("steam_path", "")
+    if sp:
+        for acc in parse_loginusers(sp).values():
+            if not acc.get("offline_mode") and acc.get("account_name"):
+                seeded.add(acc["account_name"].strip().lower())
+    seeded_list = sorted(list(seeded))
+    _reg_write_json("ProtectedAccounts", seeded_list)
+    return seeded_list
+
+def save_protected_accounts(acc_list):
+    if isinstance(acc_list, list):
+        clean = sorted(list({str(x).strip().lower() for x in acc_list if str(x).strip()}))
+        _reg_write_json("ProtectedAccounts", clean)
+        return clean
+    return load_protected_accounts()
+
+def is_account_protected_from_overwrite(acc_info, protected_set=None):
+    """Return True if an account is listed in ProtectedAccounts OR is currently in Online mode."""
+    if not isinstance(acc_info, dict):
+        return True
+    if protected_set is None:
+        protected_set = set(load_protected_accounts())
+    acc_name = str(acc_info.get("account_name") or "").strip().lower()
+    pers_name = str(acc_info.get("persona_name") or "").strip().lower()
+    sid64 = str(acc_info.get("steamid64") or "").strip().lower()
+    if (acc_name and acc_name in protected_set) or (pers_name and pers_name in protected_set) or (sid64 and sid64 in protected_set):
+        return True
+    if not acc_info.get("offline_mode", False):
+        return True
+    return False
+
+def _get_offline_and_online_sid3_sets(steam_path):
+    isolatable_offline_sids = set()
+    protected_sids = set()
+    prot_names = set(load_protected_accounts(steam_path))
+    if steam_path:
+        for acc in parse_loginusers(steam_path).values():
+            s3 = str(acc.get("steamid3") or "").strip()
+            if not s3:
+                continue
+            if is_account_protected_from_overwrite(acc, prot_names):
+                protected_sids.add(s3)
+            else:
+                isolatable_offline_sids.add(s3)
+    return isolatable_offline_sids, protected_sids
+
 def apply_personal_achievements_to_steam_bin(steam_path, sid3, appid, personal_map=None):
-    """Write personal achievement bitmasks into UserGameStats_*_<appid>.bin so Steam/game only sees user's own achievements."""
+    """Write personal achievement bitmasks ONLY into Offline/Shared Steam account bins and idle Steam Emulator files.
+    NEVER overwrites UserGameStats_<sid3>_<appid>.bin of Online (personal) Steam accounts."""
     aid_s = str(appid)
     if personal_map is None:
         personal_map = get_game_personal_achievements(aid_s)
 
     schema = parse_game_achievement_schema(steam_path, aid_s)
+    wrote_emu = False
+    if schema and aid_s in load_local_games() and not is_local_game_running(aid_s):
+        wrote_emu = apply_personal_achievements_to_emu_files(aid_s, personal_map, schema)
+
     ach_stat_ids = {item["stat_id"] for item in schema}
-    if not ach_stat_ids:
-        return False
+    if not ach_stat_ids or not steam_path:
+        return wrote_emu
+
+    offline_sids, online_sids = _get_offline_and_online_sid3_sets(steam_path)
+    sid3_s = str(sid3 or "").strip()
+
+    # SAFETY GUARD: Never overwrite Steam stats .bin for Online (Personal) accounts!
+    if sid3_s:
+        if sid3_s in online_sids or sid3_s not in offline_sids:
+            return wrote_emu
+        target_sids = {sid3_s}
+    else:
+        target_sids = set(offline_sids)
+
+    if not target_sids:
+        return wrote_emu
 
     stats_dir = os.path.join(steam_path, "appcache", "stats")
     os.makedirs(stats_dir, exist_ok=True)
-    target_bins = set(glob.glob(os.path.join(stats_dir, f"UserGameStats_*_{aid_s}.bin")))
-    if sid3:
-        target_bins.add(os.path.join(stats_dir, f"UserGameStats_{sid3}_{aid_s}.bin"))
+    target_bins = set()
+    for s3 in target_sids:
+        bp = os.path.join(stats_dir, f"UserGameStats_{s3}_{aid_s}.bin")
+        if sid3_s or os.path.exists(bp):
+            target_bins.add(bp)
     if not target_bins:
-        return False
+        return wrote_emu
 
     wrote_any = False
     for target_bin in target_bins:
@@ -495,6 +951,9 @@ def apply_personal_achievements_to_steam_bin(steam_path, sid3, appid, personal_m
                 pass
 
         cache_block = parsed_typed.setdefault("cache", {})
+        # Reset crc to 0 on offline-isolated bins so if account ever goes Online, Steam re-syncs from server instead of trusting modified cache
+        cache_block["crc"] = ("int", 0)
+        cache_block["PendingChanges"] = ("int", 0)
         for stat_id in ach_stat_ids:
             mask = 0
             times_typed = {}
@@ -522,7 +981,7 @@ def apply_personal_achievements_to_steam_bin(steam_path, sid3, appid, personal_m
             wrote_any = True
         except Exception:
             pass
-    return wrote_any
+    return wrote_any or wrote_emu
 
 def sync_cloud_achievements_bundle(steam_path=None, direction="both"):
     """Automatically sync all games' personal achievements for the logged-in Cloud user via CLOUD_ACH_APPID."""
@@ -674,7 +1133,8 @@ def capture_new_achievements_from_steam_bin(steam_path, sid3, appid, session_sta
 def get_game_achievements_view(steam_path, appid, account_info):
     aid_s = str(appid)
     sid3 = account_info.get("steamid3", "")
-    schema = parse_game_achievement_schema(steam_path, aid_s)
+    schema = parse_game_achievement_schema(steam_path, aid_s, allow_remote=True)
+    capture_new_achievements_from_steam_bin(steam_path, sid3, aid_s, session_start_ts=0, trigger_popup=False)
     personal_map = get_game_personal_achievements(aid_s)
     steam_local_map = read_steam_user_achievements(steam_path, sid3, aid_s)
 
@@ -836,6 +1296,101 @@ def get_running_steam_appid():
         return str(r_aid)
     return "0"
 
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ProcessID", ctypes.c_uint32),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", ctypes.c_uint32),
+        ("cntThreads", ctypes.c_uint32),
+        ("th32ParentProcessID", ctypes.c_uint32),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_uint32),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+_IGNORED_EXE_PREFIXES = (
+    "unins", "unitycrashhandler", "crashpad", "ue4prereq", "ueprereq",
+    "vc_redist", "vcredist", "dxsetup", "dotnet", "crashreport"
+)
+
+def get_running_process_names():
+    """Ultra-fast (~0.2ms) Win32 Toolhelp32 process snapshot with 0.8s cache and zero subprocess overhead."""
+    now = time.time()
+    if (now - PROC_SNAPSHOT_CACHE["ts"]) < 0.8 and PROC_SNAPSHOT_CACHE["names"]:
+        return PROC_SNAPSHOT_CACHE["names"]
+    names = set()
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32FirstW.restype = ctypes.c_int
+        k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+        k32.Process32NextW.restype = ctypes.c_int
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
+
+        h_snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if h_snap and h_snap != invalid_handle:
+            try:
+                pe = _PROCESSENTRY32W()
+                pe.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+                if k32.Process32FirstW(h_snap, ctypes.byref(pe)):
+                    while True:
+                        if pe.szExeFile:
+                            names.add(pe.szExeFile.lower())
+                        if not k32.Process32NextW(h_snap, ctypes.byref(pe)):
+                            break
+            finally:
+                k32.CloseHandle(h_snap)
+    except Exception:
+        pass
+    PROC_SNAPSHOT_CACHE["ts"] = now
+    PROC_SNAPSHOT_CACHE["names"] = names
+    return names
+
+def is_local_game_running(appid):
+    aid_s = str(appid)
+    proc = LOCAL_GAME_PROCS.get(aid_s)
+    if proc is not None:
+        if proc.poll() is None:
+            return True
+        LOCAL_GAME_PROCS.pop(aid_s, None)
+
+    lg = load_local_games().get(aid_s)
+    if not lg:
+        return False
+
+    running_names = get_running_process_names()
+    if not running_names:
+        return False
+
+    exe_path = lg.get("exe_path", "")
+    if exe_path:
+        exe_base = os.path.basename(exe_path).lower()
+        if exe_base and exe_base in running_names:
+            return True
+
+    install_dir = lg.get("install_dir", "")
+    if install_dir and os.path.isdir(install_dir):
+        try:
+            for root, dirs, files in os.walk(install_dir):
+                rel_depth = os.path.relpath(root, install_dir).count(os.sep)
+                if rel_depth > 2:
+                    dirs[:] = []
+                    continue
+                for fn in files:
+                    fn_low = fn.lower()
+                    if fn_low.endswith(".exe") and not fn_low.startswith(_IGNORED_EXE_PREFIXES):
+                        if fn_low in running_names:
+                            return True
+        except Exception:
+            pass
+    return False
+
 def is_app_running_in_steam(appid):
     reg = get_steam_registry_info()
     if str(reg.get("running_appid", 0)) == str(appid):
@@ -859,6 +1414,8 @@ def is_app_running_in_steam(appid):
         winreg.CloseKey(akey)
     except Exception:
         pass
+    if is_local_game_running(appid):
+        return True
     return False
 
 def get_uploading_appids():
@@ -1031,31 +1588,69 @@ def resolve_root_base_dir(root_name, steam_path, sid3, appid):
         return os.path.join(steam_path, "userdata", str(sid3), str(appid), "remote")
     return None
 
+def get_emulator_remote_save_dirs(appid, install_dir=""):
+    aid_s = str(appid).strip()
+    sys_drive = os.environ.get("SystemDrive", "C:")
+    pub_docs = os.path.join(os.environ.get("PUBLIC", os.path.join(sys_drive, "Users", "Public")), "Documents")
+    appdata = os.environ.get("APPDATA", os.path.expanduser(r"~\AppData\Roaming"))
+    cands = [
+        os.path.join(pub_docs, "Steam", "RUNE", aid_s, "remote"),
+        os.path.join(sys_drive, "\\Users\\Public\\Documents\\Steam\\RUNE", aid_s, "remote"),
+        os.path.join(appdata, "Steam", "RUNE", aid_s, "remote"),
+        os.path.join(pub_docs, "Steam", "CODEX", aid_s, "remote"),
+        os.path.join(appdata, "Steam", "CODEX", aid_s, "remote"),
+        os.path.join(appdata, "Goldberg SteamEmu Saves", aid_s, "remote"),
+        os.path.join(appdata, "GSE Saves", aid_s, "remote"),
+        os.path.join(appdata, "FLT", aid_s, "remote"),
+        os.path.join(pub_docs, "OnlineFix", aid_s, "Saves"),
+    ]
+    if install_dir and os.path.isdir(install_dir):
+        cands.append(os.path.join(install_dir, "SteamData", "remote"))
+    out = []
+    seen = set()
+    for p in cands:
+        np = os.path.normpath(p)
+        if np.lower() not in seen:
+            seen.add(np.lower())
+            out.append(np)
+    return out
+
 def get_game_save_targets(steam_path, appid, account_info):
-    """Return list of {"dir": resolved_folder, "pattern": file_pattern} for a game."""
-    sid64 = account_info.get("steamid64", "")
-    sid3 = account_info.get("steamid3", "")
+    """Return list of {"dir": resolved_folder, "pattern": file_pattern} for a game (Steam or Local Non-Steam)."""
+    aid_s = str(appid)
+    sid64 = (account_info or {}).get("steamid64", "")
+    sid3 = (account_info or {}).get("steamid3", "")
     targets = []
 
-    if appid not in UFS_CACHE:
-        parse_appinfo_vdf(steam_path, extract_ufs_appids={str(appid)})
+    local_game = load_local_games().get(aid_s)
+    if local_game and local_game.get("save_dir"):
+        targets.append({"dir": os.path.normpath(local_game["save_dir"]), "pattern": "*"})
 
-    ufs_rules = UFS_CACHE.get(str(appid), [])
+    if steam_path and aid_s not in UFS_CACHE:
+        parse_appinfo_vdf(steam_path, extract_ufs_appids={aid_s})
+
+    ufs_rules = UFS_CACHE.get(aid_s, [])
     for rule in ufs_rules:
         platforms = rule.get("platforms", {})
         if platforms and "windows" not in [str(v).lower() for v in platforms.values()]:
             continue
-        base_dir = resolve_root_base_dir(rule.get("root", ""), steam_path, sid3, appid)
+        base_dir = resolve_root_base_dir(rule.get("root", ""), steam_path, sid3, aid_s)
         if not base_dir:
             continue
         rel_path_raw = rule.get("path", "").replace("/", os.sep).replace("\\", os.sep).strip(os.sep)
+        if ("{64BitSteamID}" in rel_path_raw and not sid64) or ("{Steam3AccountID}" in rel_path_raw and not sid3):
+            glob_rel = rel_path_raw.replace("{64BitSteamID}", "*").replace("{Steam3AccountID}", "*")
+            for cand in glob.glob(os.path.join(base_dir, glob_rel)):
+                if os.path.isdir(cand):
+                    targets.append({"dir": os.path.normpath(cand), "pattern": rule.get("pattern", "*")})
+            continue
         rel_path = rel_path_raw.replace("{64BitSteamID}", sid64).replace("{Steam3AccountID}", sid3)
         full_dir = os.path.normpath(os.path.join(base_dir, rel_path))
         pattern = rule.get("pattern", "*")
         targets.append({"dir": full_dir, "pattern": pattern})
 
         # If {64BitSteamID} folder for this account doesn't exist yet, check if saves exist under another SteamID64 folder and migrate/include them
-        if "{64BitSteamID}" in rel_path_raw and not os.path.isdir(full_dir):
+        if "{64BitSteamID}" in rel_path_raw and sid64 and not os.path.isdir(full_dir):
             glob_rel = rel_path_raw.replace("{64BitSteamID}", "*").replace("{Steam3AccountID}", "*")
             for cand in glob.glob(os.path.join(base_dir, glob_rel)):
                 if os.path.isdir(cand):
@@ -1069,10 +1664,22 @@ def get_game_save_targets(steam_path, appid, account_info):
                     except Exception:
                         pass
 
-    # Also check userdata/<sid3>/<appid>/remote
-    remote_dir = os.path.join(steam_path, "userdata", str(sid3), str(appid), "remote")
-    if os.path.isdir(remote_dir) or not targets:
-        targets.append({"dir": remote_dir, "pattern": "*"})
+    # Check emulator remote save directories (RUNE, CODEX, Goldberg, GSE, Tenoke, FLT)
+    emu_install_dir = local_game.get("install_dir", "") if local_game else ""
+    for emu_rdir in get_emulator_remote_save_dirs(aid_s, install_dir=emu_install_dir):
+        if os.path.isdir(emu_rdir):
+            try:
+                has_any_file = any(files for _, _, files in os.walk(emu_rdir))
+            except Exception:
+                has_any_file = False
+            if has_any_file or not targets:
+                targets.append({"dir": emu_rdir, "pattern": "*"})
+
+    # Also check userdata/<sid3>/<appid>/remote when associated with a Steam account
+    if steam_path and sid3:
+        remote_dir = os.path.join(steam_path, "userdata", str(sid3), aid_s, "remote")
+        if os.path.isdir(remote_dir) or not targets:
+            targets.append({"dir": remote_dir, "pattern": "*"})
 
     # De-duplicate targets
     unique = []
@@ -1084,8 +1691,11 @@ def get_game_save_targets(steam_path, appid, account_info):
             unique.append(t)
     return unique
 
+_IGNORED_SAVE_DIRS = {"gpucache", "code cache", "shadercache", "crashdumps", "crashes", "logs", "webcache", "d3dshader_cache"}
+_IGNORED_SAVE_EXTS = (".log", ".dmp", ".tmp")
+
 def collect_local_save_files(steam_path, appid, account_info):
-    """Find all matching local save files for a game directly in Steam's save folder, returning (files_list, latest_mtime, combined_sha256)."""
+    """Find all matching local save files for a game directly in Steam's or Local Game's save folder, returning (files_list, latest_mtime, combined_sha256)."""
     targets = get_game_save_targets(steam_path, appid, account_info)
     matched_files = []  # list of (target_idx, rel_path_in_target, abs_path, mtime)
     latest_mtime = 0
@@ -1095,11 +1705,13 @@ def collect_local_save_files(steam_path, appid, account_info):
         pattern = t["pattern"]
         if not os.path.isdir(base_dir):
             continue
-        for root, _, files in os.walk(base_dir):
+        for root, dirs, files in os.walk(base_dir):
+            dirs[:] = [d for d in dirs if d.lower() not in _IGNORED_SAVE_DIRS]
             for fname in files:
-                if fname.lower() == "steam_autocloud.vdf":
+                fn_low = fname.lower()
+                if fn_low == "steam_autocloud.vdf" or fn_low.endswith(_IGNORED_SAVE_EXTS):
                     continue
-                if fnmatch.fnmatch(fname.lower(), pattern.lower()) or pattern == "*":
+                if fnmatch.fnmatch(fn_low, pattern.lower()) or pattern == "*":
                     abs_p = os.path.join(root, fname)
                     rel_p = os.path.relpath(abs_p, base_dir).replace("\\", "/")
                     mtime = int(os.path.getmtime(abs_p))
@@ -1511,20 +2123,35 @@ def watch_game_and_auto_upload(steam_path, appid, account_info, game_name):
         UPLOADING_APPIDS.discard(watch_key)
         ACTIVE_WATCHERS.discard(watch_key)
 
+def resolve_game_name(steam_path, appid):
+    aid_s = str(appid)
+    lg = load_local_games().get(aid_s)
+    if lg and lg.get("name"):
+        return lg["name"]
+    appinfo = parse_appinfo_vdf(steam_path)
+    if aid_s in appinfo and appinfo[aid_s].get("name"):
+        return appinfo[aid_s]["name"]
+    return f"App {aid_s}"
+
 def global_game_watcher_loop():
-    """Continuous background daemon: auto-syncs Cloud achievements on startup and attaches real-time watcher to any running Steam game."""
+    """Continuous background daemon: auto-syncs Cloud achievements on startup and attaches real-time watcher to any running Steam or Local game."""
     time.sleep(1.5)
     try:
         reg = get_steam_registry_info()
         sp = reg["steam_path"]
         # 1. Sync personal achievements with Cloud on startup
         sync_cloud_achievements_bundle(sp, direction="both")
-        # 2. Sanitize local Steam achievement bins for all non-running installed games so shared-account achievements don't leak
-        running_now = get_running_steam_appid()
+        # 2. Import any pre-existing unlocked emulator achievements for Local Games without popup spam
+        for l_aid, lg in load_local_games().items():
+            parse_game_achievement_schema(sp, l_aid, allow_remote=True)
+            capture_new_achievements_from_steam_bin(sp, "", l_aid, session_start_ts=0, game_name=lg.get("name", ""), trigger_popup=False)
+        # 3. Import existing Steam achievements from Online (Personal) accounts so they are never lost
+        accounts = parse_loginusers(sp)
         installed = get_installed_games(sp)
-        for aid in installed:
-            if str(aid) != str(running_now):
-                apply_personal_achievements_to_steam_bin(sp, "", aid)
+        for acc in accounts.values():
+            if not acc.get("offline_mode") and acc.get("steamid3"):
+                for aid in installed:
+                    capture_new_achievements_from_steam_bin(sp, acc["steamid3"], aid, session_start_ts=0, trigger_popup=False)
         build_full_state()
     except Exception:
         pass
@@ -1550,6 +2177,19 @@ def global_game_watcher_loop():
                     args=(sp, running_aid, acc_info, gname),
                     daemon=True
                 ).start()
+
+            # Also watch any Local Game (Non-Steam) even if user launched its .exe directly from Windows Explorer
+            local_games = load_local_games()
+            if local_games:
+                for l_aid, lg in local_games.items():
+                    if l_aid not in ACTIVE_WATCHERS and is_local_game_running(l_aid):
+                        reg = get_steam_registry_info()
+                        sp = reg["steam_path"]
+                        threading.Thread(
+                            target=watch_game_and_auto_upload,
+                            args=(sp, l_aid, {"account_name": "LOCAL", "steamid3": "", "steamid64": ""}, lg.get("name") or f"App {l_aid}"),
+                            daemon=True
+                        ).start()
         except Exception:
             pass
         time.sleep(1.5)
@@ -1601,10 +2241,31 @@ def get_library_folders(steam_path):
             pass
     return folders
 
+LOCAL_DIR_SIZE_CACHE = {}
+
+def _get_cached_dir_size(folder_path):
+    if not folder_path or not os.path.isdir(folder_path):
+        return 0
+    norm = os.path.normpath(folder_path)
+    if norm in LOCAL_DIR_SIZE_CACHE:
+        return LOCAL_DIR_SIZE_CACHE[norm]
+    total = 0
+    try:
+        for root, _, files in os.walk(norm):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    LOCAL_DIR_SIZE_CACHE[norm] = total
+    return total
+
 def get_installed_games(steam_path):
-    """Scan all library folders for appmanifest_*.acf."""
+    """Scan all library folders for appmanifest_*.acf, plus registered Local Games."""
     installed = {}
-    folders = get_library_folders(steam_path)
+    folders = get_library_folders(steam_path) if steam_path else []
     for folder in folders:
         steamapps = os.path.join(folder, "steamapps")
         if not os.path.isdir(steamapps):
@@ -1637,10 +2298,35 @@ def get_installed_games(steam_path):
                     "last_played": int(m_lp.group(1)) if m_lp else 0,
                     "last_owner_sid64": m_owner.group(1) if m_owner else "",
                     "drive": drive,
-                    "library_path": folder
+                    "library_path": folder,
+                    "is_local": False
                 }
             except Exception:
                 pass
+
+    for l_aid, lg in load_local_games().items():
+        if l_aid in installed:
+            continue
+        idir = lg.get("install_dir", "")
+        exe_p = lg.get("exe_path", "")
+        exists_now = bool((exe_p and os.path.isfile(exe_p)) or (idir and os.path.isdir(idir)))
+        if not exists_now:
+            continue
+        sz = _get_cached_dir_size(idir)
+        drive = os.path.splitdrive(idir or exe_p)[0] or "Lokal"
+        installed[l_aid] = {
+            "appid": l_aid,
+            "name": lg.get("name") or f"App {l_aid}",
+            "install_dir": idir,
+            "exe_path": exe_p,
+            "size_bytes": sz,
+            "size_gb": round(sz / (1024 ** 3), 2) if sz > 0 else 0,
+            "last_played": int(lg.get("last_played") or 0),
+            "last_owner_sid64": "",
+            "drive": drive,
+            "library_path": idir,
+            "is_local": True
+        }
     return installed
 
 def get_userdata_account_games(steam_path, accounts):
@@ -1688,23 +2374,480 @@ def get_userdata_account_games(steam_path, accounts):
 
     return account_games, last_played_per_acc
 
+def _get_cached_cover_path(appid):
+    return os.path.join(LOCAL_DATA_ROOT, "covers", f"{appid}.jpg")
+
 def find_local_cover(steam_path, appid):
-    """Find cached cover image in Steam's appcache/librarycache/<appid>."""
-    libcache = os.path.join(steam_path, "appcache", "librarycache", str(appid))
-    if not os.path.isdir(libcache):
-        return None
-    found_files = {}
-    for root, _, files in os.walk(libcache):
-        for f in files:
-            if f not in found_files:
-                found_files[f] = os.path.join(root, f)
-    for pref in ["library_600x900.jpg", "library_capsule.jpg", "library_header.jpg", "header.jpg"]:
-        if pref in found_files:
-            return found_files[pref]
-    for f, full_path in found_files.items():
-        if f.endswith(".jpg") and "blur" not in f and "hero" not in f:
-            return full_path
+    """Find cached cover image in Steam's appcache/librarycache/<appid> or SteamSwitcher local cache."""
+    aid_s = str(appid)
+    if steam_path:
+        libcache = os.path.join(steam_path, "appcache", "librarycache", aid_s)
+        if os.path.isdir(libcache):
+            found_files = {}
+            for root, _, files in os.walk(libcache):
+                for f in files:
+                    if f not in found_files:
+                        found_files[f] = os.path.join(root, f)
+            for pref in ["library_600x900.jpg", "library_capsule.jpg", "library_header.jpg", "header.jpg"]:
+                if pref in found_files:
+                    return found_files[pref]
+            for f, full_path in found_files.items():
+                if f.endswith(".jpg") and "blur" not in f and "hero" not in f:
+                    return full_path
+    custom_cov = _get_cached_cover_path(aid_s)
+    if os.path.isfile(custom_cov):
+        return custom_cov
     return None
+
+def ensure_local_game_assets_async(steam_path, appid):
+    """Background fetch & cache of official Steam cover art and achievement schema for Local Games."""
+    aid_s = str(appid).strip()
+    if not aid_s.isdigit():
+        return
+
+    need_schema = (aid_s not in SCHEMA_CACHE) and (not os.path.exists(_get_cached_schema_json_path(aid_s)))
+    need_cover = (aid_s not in COVER_CACHE) and (find_local_cover(steam_path, aid_s) is None)
+    if not need_schema and not need_cover:
+        return
+    if aid_s in SCHEMA_FETCHING:
+        return
+    SCHEMA_FETCHING.add(aid_s)
+
+    def _worker():
+        changed = False
+        try:
+            if need_schema:
+                achs = fetch_remote_achievement_schema(aid_s)
+                if achs is not None:
+                    changed = True
+            if need_cover:
+                cov_dst = _get_cached_cover_path(aid_s)
+                os.makedirs(os.path.dirname(cov_dst), exist_ok=True)
+                for url in (
+                    f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{aid_s}/library_600x900.jpg",
+                    f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{aid_s}/header.jpg",
+                ):
+                    try:
+                        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+                        with urllib.request.urlopen(req, timeout=8) as r:
+                            raw = r.read()
+                            if raw and len(raw) > 1024:
+                                with open(cov_dst, "wb") as cf:
+                                    cf.write(raw)
+                                COVER_CACHE[aid_s] = raw
+                                COVER_B64_CACHE[aid_s] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+                                changed = True
+                                break
+                    except Exception:
+                        pass
+            if changed:
+                build_full_state()
+        finally:
+            SCHEMA_FETCHING.discard(aid_s)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+class _OPENFILENAMEW(ctypes.Structure):
+    _fields_ = [
+        ("lStructSize", ctypes.c_uint32),
+        ("hwndOwner", ctypes.c_void_p),
+        ("hInstance", ctypes.c_void_p),
+        ("lpstrFilter", ctypes.c_void_p),
+        ("lpstrCustomFilter", ctypes.c_void_p),
+        ("nMaxCustFilter", ctypes.c_uint32),
+        ("nFilterIndex", ctypes.c_uint32),
+        ("lpstrFile", ctypes.c_void_p),
+        ("nMaxFile", ctypes.c_uint32),
+        ("lpstrFileTitle", ctypes.c_void_p),
+        ("nMaxFileTitle", ctypes.c_uint32),
+        ("lpstrInitialDir", ctypes.c_wchar_p),
+        ("lpstrTitle", ctypes.c_wchar_p),
+        ("Flags", ctypes.c_uint32),
+        ("nFileOffset", ctypes.c_uint16),
+        ("nFileExtension", ctypes.c_uint16),
+        ("lpstrDefExt", ctypes.c_wchar_p),
+        ("lCustData", ctypes.c_void_p),
+        ("lpfnHook", ctypes.c_void_p),
+        ("lpTemplateName", ctypes.c_wchar_p),
+        ("pvReserved", ctypes.c_void_p),
+        ("dwReserved", ctypes.c_uint32),
+        ("FlagsEx", ctypes.c_uint32),
+    ]
+
+class _BROWSEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hwndOwner", ctypes.c_void_p),
+        ("pidlRoot", ctypes.c_void_p),
+        ("pszDisplayName", ctypes.c_void_p),
+        ("lpszTitle", ctypes.c_wchar_p),
+        ("ulFlags", ctypes.c_uint32),
+        ("lpfn", ctypes.c_void_p),
+        ("lParam", ctypes.c_void_p),
+        ("iImage", ctypes.c_int),
+    ]
+
+def pick_exe_file_dialog(initial_dir=""):
+    """Open native Win32 OpenFileDialog for selecting a game .exe file."""
+    try:
+        u32 = ctypes.windll.user32
+        u32.GetForegroundWindow.restype = ctypes.c_void_p
+        comdlg = ctypes.windll.comdlg32
+        comdlg.GetOpenFileNameW.argtypes = [ctypes.POINTER(_OPENFILENAMEW)]
+        comdlg.GetOpenFileNameW.restype = ctypes.c_int
+
+        file_buf = ctypes.create_unicode_buffer(1024)
+        flt_str = "Game Executable (*.exe)\0*.exe\0Semua File (*.*)\0*.*\0\0"
+        flt_buf = ctypes.create_unicode_buffer(flt_str, len(flt_str))
+
+        ofn = _OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(_OPENFILENAMEW)
+        ofn.hwndOwner = u32.GetForegroundWindow()
+        ofn.lpstrFilter = ctypes.addressof(flt_buf)
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = ctypes.addressof(file_buf)
+        ofn.nMaxFile = 1024
+        if initial_dir and os.path.isdir(initial_dir):
+            ofn.lpstrInitialDir = os.path.normpath(initial_dir)
+        ofn.lpstrTitle = "Pilih File .exe Game Lokal"
+        # OFN_EXPLORER (0x80000) | OFN_FILEMUSTEXIST (0x1000) | OFN_PATHMUSTEXIST (0x800) | OFN_NOCHANGEDIR (0x8)
+        ofn.Flags = 0x00081808
+        ofn.lpstrDefExt = "exe"
+        if comdlg.GetOpenFileNameW(ctypes.byref(ofn)):
+            return os.path.normpath(file_buf.value)
+    except Exception:
+        pass
+    return ""
+
+def pick_folder_dialog(title="Pilih Folder"):
+    """Open native Win32 BrowseForFolder dialog."""
+    try:
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        u32 = ctypes.windll.user32
+        u32.GetForegroundWindow.restype = ctypes.c_void_p
+        sh32 = ctypes.windll.shell32
+        sh32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(_BROWSEINFOW)]
+        sh32.SHBrowseForFolderW.restype = ctypes.c_void_p
+        sh32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        sh32.SHGetPathFromIDListW.restype = ctypes.c_int
+
+        disp_buf = ctypes.create_unicode_buffer(260)
+        path_buf = ctypes.create_unicode_buffer(1024)
+        bi = _BROWSEINFOW()
+        bi.hwndOwner = u32.GetForegroundWindow()
+        bi.pszDisplayName = ctypes.addressof(disp_buf)
+        bi.lpszTitle = title
+        # BIF_RETURNONLYFSDIRS (0x1) | BIF_NEWDIALOGSTYLE (0x40) | BIF_EDITBOX (0x10)
+        bi.ulFlags = 0x00000051
+        pidl = sh32.SHBrowseForFolderW(ctypes.byref(bi))
+        if pidl:
+            try:
+                if sh32.SHGetPathFromIDListW(pidl, ctypes.addressof(path_buf)):
+                    return os.path.normpath(path_buf.value)
+            finally:
+                ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+    except Exception:
+        pass
+    return ""
+
+def _extract_appid_from_input(text):
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        return s
+    m = re.search(r"store\.steampowered\.com/app/(\d+)", s, re.IGNORECASE)
+    if not m:
+        m = re.search(r"steamcommunity\.com/(?:app|stats)/(\d+)", s, re.IGNORECASE)
+    if not m:
+        m = re.search(r"\b(\d{4,9})\b", s)
+    return m.group(1) if m else ""
+
+def _find_best_exe_in_folder(folder_path):
+    if not folder_path or not os.path.isdir(folder_path):
+        return ""
+    folder_norm = os.path.normpath(folder_path)
+    folder_stem = re.sub(r"[^a-z0-9]", "", os.path.basename(folder_norm).lower())
+    candidates = []
+    for root, dirs, files in os.walk(folder_norm):
+        rel = os.path.relpath(root, folder_norm)
+        depth = 0 if rel == "." else (rel.count(os.sep) + 1)
+        if depth > 3:
+            dirs[:] = []
+            continue
+        for fn in files:
+            fn_low = fn.lower()
+            if not fn_low.endswith(".exe") or fn_low.startswith(_IGNORED_EXE_PREFIXES):
+                continue
+            fp = os.path.join(root, fn)
+            try:
+                sz = os.path.getsize(fp)
+            except Exception:
+                sz = 0
+            stem_clean = re.sub(r"[^a-z0-9]", "", os.path.splitext(fn_low)[0])
+            name_bonus = 1 if (folder_stem and (stem_clean == folder_stem or stem_clean in folder_stem or folder_stem in stem_clean)) else 0
+            shipping_bonus = 1 if "win64-shipping" in fn_low else 0
+            # Prefer matching name / Unreal Win64-Shipping / shallower depth / larger size
+            score = (shipping_bonus * 4) + (name_bonus * 3) - (depth * 0.5) + min(sz / (50 * 1024 * 1024), 2.5)
+            candidates.append((score, sz, fp))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
+
+def _resolve_game_install_root_from_exe(exe_path):
+    exe_dir = os.path.dirname(os.path.normpath(exe_path))
+    parts = [p.lower() for p in exe_dir.split(os.sep)]
+    # Handle Unreal Engine <GameRoot>/<Project>/Binaries/Win64/<Game>-Win64-Shipping.exe
+    if len(parts) >= 3 and parts[-1] in ("win64", "win32", "wingdk") and parts[-2] == "binaries":
+        cand_parent = os.path.dirname(os.path.dirname(exe_dir))
+        cand_root = os.path.dirname(cand_parent)
+        if os.path.isfile(os.path.join(cand_root, os.path.basename(cand_parent) + ".exe")):
+            return cand_root
+        return cand_parent
+    return exe_dir
+
+def _detect_appid_and_emulator_in_dir(install_dir, exe_path=""):
+    """Scan game directory for Steam Emulator config files (RUNE, CODEX, Goldberg, Tenoke, FLT, OnlineFix, etc.) to extract AppId."""
+    search_roots = []
+    if exe_path:
+        search_roots.append(os.path.dirname(os.path.normpath(exe_path)))
+    if install_dir:
+        norm_i = os.path.normpath(install_dir)
+        if norm_i not in search_roots:
+            search_roots.append(norm_i)
+        parent_i = os.path.dirname(norm_i)
+        if parent_i and parent_i != norm_i and os.path.basename(norm_i).lower() in ("bin", "x64", "win64", "game"):
+            search_roots.append(parent_i)
+
+    appid_found = ""
+    emu_found = ""
+
+    for sroot in search_roots:
+        if not os.path.isdir(sroot):
+            continue
+        for root, dirs, files in os.walk(sroot):
+            rel = os.path.relpath(root, sroot)
+            depth = 0 if rel == "." else (rel.count(os.sep) + 1)
+            if depth > 3:
+                dirs[:] = []
+                continue
+            files_low = {f.lower(): f for f in files}
+
+            if "steam_api64.rne" in files_low or "steam_api.rne" in files_low:
+                emu_found = emu_found or "RUNE"
+            elif "steam_api64.cdx" in files_low or "steam_api.cdx" in files_low:
+                emu_found = emu_found or "CODEX"
+
+            if "steam_emu.ini" in files_low:
+                fp = os.path.join(root, files_low["steam_emu.ini"])
+                try:
+                    txt = open(fp, "r", encoding="utf-8", errors="ignore").read()
+                    if "RUNE" in txt and not emu_found:
+                        emu_found = "RUNE"
+                    elif not emu_found:
+                        emu_found = "CODEX"
+                    m = re.search(r"^\s*AppId\s*=\s*(\d+)", txt, re.IGNORECASE | re.MULTILINE)
+                    if m and int(m.group(1)) > 0:
+                        return m.group(1), (emu_found or "RUNE")
+                except Exception:
+                    pass
+
+            if "steam_appid.txt" in files_low:
+                fp = os.path.join(root, files_low["steam_appid.txt"])
+                try:
+                    txt = open(fp, "r", encoding="utf-8", errors="ignore").read().strip()
+                    m = re.search(r"(\d+)", txt)
+                    if m and int(m.group(1)) > 0:
+                        is_gb = ("steam_settings" in root.lower()) or os.path.isdir(os.path.join(root, "steam_settings"))
+                        return m.group(1), (emu_found or ("Goldberg" if is_gb else "SteamEmu"))
+                except Exception:
+                    pass
+
+            for ini_name, label, rx in (
+                ("tenoke.ini", "Tenoke", r"^\s*id\s*=\s*(\d+)"),
+                ("flt.ini", "FLT", r"^\s*appid\s*=\s*(\d+)"),
+                ("onlinefix.ini", "OnlineFix", r"^\s*(?:Real)?AppId\s*=\s*(\d+)"),
+                ("coldclientloader.ini", "Goldberg", r"^\s*AppId\s*=\s*(\d+)"),
+                ("ali213.ini", "ALI213", r"^\s*AppID\s*=\s*(\d+)"),
+                ("valve.ini", "ALI213", r"^\s*AppID\s*=\s*(\d+)"),
+                ("skidrow.ini", "SKIDROW", r"^\s*AppId\s*=\s*(\d+)"),
+                ("smartsteamemu.ini", "SmartSteamEmu", r"^\s*AppId\s*=\s*(\d+)"),
+            ):
+                if ini_name in files_low:
+                    fp = os.path.join(root, files_low[ini_name])
+                    try:
+                        txt = open(fp, "r", encoding="utf-8", errors="ignore").read()
+                        m = re.search(rx, txt, re.IGNORECASE | re.MULTILINE)
+                        if m and int(m.group(1)) > 0:
+                            return m.group(1), label
+                    except Exception:
+                        pass
+
+    return appid_found, emu_found
+
+def _fetch_steam_store_game_name(appid):
+    aid_s = str(appid).strip()
+    if not aid_s.isdigit():
+        return ""
+    try:
+        url = f"https://store.steampowered.com/api/appdetails?appids={aid_s}&l=english"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            obj = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        data_blk = (obj.get(aid_s) or {}).get("data") or {}
+        if isinstance(data_blk, dict) and data_blk.get("name"):
+            return str(data_blk["name"]).strip()
+    except Exception:
+        pass
+    return ""
+
+def _search_steam_store_by_name(query_name):
+    q = re.sub(r"[-_.]*(steamrip|repack|fitgirl|dodi|elamigos|rune|codex|tenoke|goldberg|v\d[\d.]*|com)\b.*", "", str(query_name or ""), flags=re.IGNORECASE)
+    q = re.sub(r"[_\-.]+", " ", q).strip()
+    if not q:
+        return "", ""
+    try:
+        url = f"https://store.steampowered.com/api/storesearch/?term={urllib.parse.quote(q)}&l=english&cc=US"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SteamSwitcher/2.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            obj = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        items = obj.get("items") or []
+        if items and isinstance(items[0], dict):
+            return str(items[0].get("id") or ""), str(items[0].get("name") or "")
+    except Exception:
+        pass
+    return "", ""
+
+def auto_detect_local_save_dir(steam_path, appid, game_name, exe_path="", install_dir=""):
+    """Smart scan of UFS rules, AppData (Local/LocalLow/Roaming), Saved Games, Documents, and Emulator remote folders."""
+    aid_s = str(appid).strip()
+    if steam_path and aid_s:
+        if aid_s not in UFS_CACHE:
+            parse_appinfo_vdf(steam_path, extract_ufs_appids={aid_s})
+        for rule in UFS_CACHE.get(aid_s, []):
+            base_dir = resolve_root_base_dir(rule.get("root", ""), steam_path, "", aid_s)
+            if base_dir:
+                rel = rule.get("path", "").replace("/", os.sep).replace("\\", os.sep).strip(os.sep)
+                if "{" not in rel:
+                    cand = os.path.normpath(os.path.join(base_dir, rel))
+                    if os.path.isdir(cand):
+                        return cand
+
+    norm_keys = set()
+    for raw_n in (game_name, os.path.splitext(os.path.basename(exe_path or ""))[0], os.path.basename(install_dir or "")):
+        cleaned = re.sub(r"[^a-z0-9]", "", str(raw_n or "").lower())
+        if len(cleaned) >= 3:
+            norm_keys.add(cleaned)
+
+    user_prof = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+    save_roots = [
+        os.environ.get("LOCALAPPDATA", os.path.join(user_prof, "AppData", "Local")),
+        os.path.join(user_prof, "AppData", "LocalLow"),
+        os.environ.get("APPDATA", os.path.join(user_prof, "AppData", "Roaming")),
+        os.path.join(user_prof, "Saved Games"),
+        os.path.join(user_prof, "Documents", "My Games"),
+        os.path.join(user_prof, "Documents"),
+    ]
+
+    # 1. Exact folder name match in top-level save roots (e.g. %LOCALAPPDATA%\StoneShard)
+    for sroot in save_roots:
+        if not os.path.isdir(sroot):
+            continue
+        try:
+            for entry in os.listdir(sroot):
+                full_p = os.path.join(sroot, entry)
+                if not os.path.isdir(full_p):
+                    continue
+                e_norm = re.sub(r"[^a-z0-9]", "", entry.lower())
+                if e_norm in norm_keys:
+                    return os.path.normpath(full_p)
+        except Exception:
+            pass
+
+    # 2. One-level-deep Publisher\<GameName> in LocalLow / Roaming / Local
+    for sroot in save_roots[:4]:
+        if not os.path.isdir(sroot):
+            continue
+        try:
+            for pub in os.listdir(sroot):
+                pub_p = os.path.join(sroot, pub)
+                if not os.path.isdir(pub_p) or pub.lower() in ("microsoft", "packages", "temp", "google", "mozilla", "nvidia", "amd", "steam"):
+                    continue
+                for sub in os.listdir(pub_p):
+                    sub_p = os.path.join(pub_p, sub)
+                    if os.path.isdir(sub_p) and re.sub(r"[^a-z0-9]", "", sub.lower()) in norm_keys:
+                        return os.path.normpath(sub_p)
+        except Exception:
+            pass
+
+    # 3. Emulator remote folder if it exists
+    if aid_s:
+        for emu_r in get_emulator_remote_save_dirs(aid_s, install_dir=install_dir):
+            if os.path.isdir(emu_r):
+                return emu_r
+
+    return ""
+
+def detect_local_game_metadata(steam_path, path_input="", appid_or_url=""):
+    """Inspect a local .exe or folder + optional Steam AppID/URL and return auto-detected metadata."""
+    raw_p = os.path.normpath(path_input.strip().strip('"')) if path_input and path_input.strip() else ""
+    exe_path = ""
+    install_dir = ""
+
+    if raw_p:
+        if os.path.isfile(raw_p):
+            exe_path = raw_p
+            install_dir = _resolve_game_install_root_from_exe(exe_path)
+        elif os.path.isdir(raw_p):
+            install_dir = raw_p
+            exe_path = _find_best_exe_in_folder(install_dir)
+            if exe_path:
+                install_dir = _resolve_game_install_root_from_exe(exe_path) if install_dir != raw_p else raw_p
+
+    manual_appid = _extract_appid_from_input(appid_or_url)
+    det_appid, emu_type = _detect_appid_and_emulator_in_dir(install_dir, exe_path)
+    appid = manual_appid or det_appid
+
+    fallback_title = ""
+    if install_dir:
+        fallback_title = os.path.basename(install_dir)
+    elif exe_path:
+        fallback_title = os.path.splitext(os.path.basename(exe_path))[0]
+
+    game_name = ""
+    if not appid and fallback_title:
+        s_aid, s_name = _search_steam_store_by_name(fallback_title)
+        if s_aid:
+            appid = s_aid
+            game_name = s_name
+
+    if appid and not game_name:
+        appinfo = parse_appinfo_vdf(steam_path) if steam_path else {}
+        if appid in appinfo and appinfo[appid].get("name"):
+            game_name = appinfo[appid]["name"]
+        else:
+            game_name = _fetch_steam_store_game_name(appid)
+
+    if not game_name:
+        game_name = fallback_title or (f"App {appid}" if appid else "")
+
+    save_dir = auto_detect_local_save_dir(steam_path, appid, game_name, exe_path=exe_path, install_dir=install_dir)
+    ach_count = 0
+    if appid and appid.isdigit():
+        schema = parse_game_achievement_schema(steam_path, appid, allow_remote=True)
+        ach_count = len(schema)
+        ensure_local_game_assets_async(steam_path, appid)
+
+    return {
+        "appid": appid,
+        "name": game_name,
+        "exe_path": exe_path,
+        "install_dir": install_dir,
+        "save_dir": save_dir,
+        "emu_type": emu_type or (" Emulator Lokal" if det_appid else "Lokal"),
+        "ach_total": ach_count,
+    }
 
 def load_patched_games():
     data = _reg_read_json("PatchedGames")
@@ -2076,11 +3219,12 @@ def build_full_state():
     steam_path = reg["steam_path"]
     accounts = parse_loginusers(steam_path)
     installed = get_installed_games(steam_path)
+    local_games = load_local_games()
     account_games, last_played_per_acc = get_userdata_account_games(steam_path, accounts)
 
     acc_sizes = {acc_name: len(gset) for acc_name, gset in account_games.items()}
 
-    all_appids = set()
+    all_appids = set(local_games.keys())
     for gset in account_games.values():
         all_appids.update(gset)
 
@@ -2095,43 +3239,53 @@ def build_full_state():
     for aid in all_appids:
         if aid in NON_GAME_APPIDS:
             continue
-        info_meta = appinfo.get(aid, {})
-        gtype = info_meta.get("type", "game")
-        if gtype not in ("game", ""):
-            continue
-
         inst_info = installed.get(aid)
-        has_local_cover = os.path.isdir(os.path.join(steam_path, "appcache", "librarycache", str(aid)))
+        lg_entry = local_games.get(aid)
+        is_local_only = bool(lg_entry and not (inst_info and not inst_info.get("is_local")))
 
-        name = (inst_info["name"] if inst_info else None) or info_meta.get("name")
-        if not name:
-            continue
+        info_meta = appinfo.get(aid, {})
+        if not is_local_only:
+            gtype = info_meta.get("type", "game")
+            if gtype not in ("game", ""):
+                continue
 
-        associated_accounts = [acc_name for acc_name, gset in account_games.items() if aid in gset]
-        if not associated_accounts:
-            continue
+        cov_path = find_local_cover(steam_path, aid)
+        has_local_cover = bool(cov_path and os.path.exists(cov_path))
 
-        associated_sorted = sorted(associated_accounts, key=lambda x: acc_sizes.get(x, 9999))
-        owner_account = associated_sorted[0]
+        if is_local_only:
+            name = lg_entry.get("name") or (inst_info["name"] if inst_info else None) or info_meta.get("name") or f"App {aid}"
+            owner_account = "LOCAL"
+            owner_persona = "Game Lokal"
+            associated_accounts = ["LOCAL"]
+            lp_ts = int(lg_entry.get("last_played") or 0)
+            acc_info = {"account_name": "LOCAL", "persona_name": "Game Lokal", "steamid3": "", "steamid64": ""}
+            ensure_local_game_assets_async(steam_path, aid)
+        else:
+            name = (inst_info["name"] if inst_info else None) or info_meta.get("name")
+            if not name:
+                continue
+            associated_accounts = [acc_name for acc_name, gset in account_games.items() if aid in gset]
+            if not associated_accounts:
+                continue
+            associated_sorted = sorted(associated_accounts, key=lambda x: acc_sizes.get(x, 9999))
+            owner_account = associated_sorted[0]
+            lp_ts = inst_info["last_played"] if inst_info else 0
+            for acc_name in associated_accounts:
+                acc_lp = last_played_per_acc.get(acc_name, {}).get(aid, 0)
+                if acc_lp > lp_ts:
+                    lp_ts = acc_lp
+            acc_info = accounts.get(owner_account, {})
+            owner_persona = acc_info.get("persona_name", owner_account)
 
-        lp_ts = inst_info["last_played"] if inst_info else 0
-        for acc_name in associated_accounts:
-            acc_lp = last_played_per_acc.get(acc_name, {}).get(aid, 0)
-            if acc_lp > lp_ts:
-                lp_ts = acc_lp
+        if aid not in COVER_CACHE and cov_path and os.path.exists(cov_path):
+            try:
+                with open(cov_path, "rb") as cf:
+                    raw_bytes = cf.read()
+                    COVER_CACHE[aid] = raw_bytes
+                    COVER_B64_CACHE[aid] = "data:image/jpeg;base64," + base64.b64encode(raw_bytes).decode("ascii")
+            except Exception:
+                pass
 
-        if aid not in COVER_CACHE:
-            cov_path = find_local_cover(steam_path, aid)
-            if cov_path and os.path.exists(cov_path):
-                try:
-                    with open(cov_path, "rb") as cf:
-                        raw_bytes = cf.read()
-                        COVER_CACHE[aid] = raw_bytes
-                        COVER_B64_CACHE[aid] = "data:image/jpeg;base64," + base64.b64encode(raw_bytes).decode("ascii")
-                except Exception:
-                    pass
-
-        acc_info = accounts.get(owner_account, {})
         save_files, save_mtime, _ = collect_local_save_files(steam_path, aid, acc_info)
         ach_schema = parse_game_achievement_schema(steam_path, aid)
         pers_ach = get_game_personal_achievements(aid)
@@ -2142,6 +3296,11 @@ def build_full_state():
         games_list.append({
             "appid": aid,
             "name": name,
+            "is_local": is_local_only,
+            "exe_path": lg_entry.get("exe_path", "") if lg_entry else "",
+            "install_dir": (lg_entry.get("install_dir") if is_local_only else (inst_info["install_dir"] if inst_info else "")) or "",
+            "save_dir": lg_entry.get("save_dir", "") if lg_entry else "",
+            "emu_type": lg_entry.get("emu_type", "") if lg_entry else "",
             "installed": inst_info is not None,
             "running": str(aid) in running_ids,
             "uploading": str(aid) in uploading_ids,
@@ -2150,7 +3309,7 @@ def build_full_state():
             "drive": inst_info["drive"] if inst_info else "",
             "last_played": lp_ts,
             "owner_account": owner_account,
-            "owner_persona": acc_info.get("persona_name", owner_account),
+            "owner_persona": owner_persona,
             "accounts": associated_accounts,
             "has_local_cover": has_local_cover,
             "cover_src": COVER_B64_CACHE.get(aid, f"/api/cover/{aid}"),
@@ -2163,12 +3322,20 @@ def build_full_state():
 
     games_list.sort(key=lambda g: (g["name"].lower(), g["appid"]))
 
+    prot_list = load_protected_accounts(steam_path)
+    prot_set = set(prot_list)
     accounts_list = []
     for acc_name, acc in accounts.items():
         acc_games = [g for g in games_list if g["owner_account"] == acc_name]
         inst_count = sum(1 for g in acc_games if g["installed"])
+        is_prot = (
+            acc_name.strip().lower() in prot_set
+            or str(acc.get("persona_name") or "").strip().lower() in prot_set
+            or str(acc.get("steamid64") or "").strip().lower() in prot_set
+        )
         accounts_list.append({
             **acc,
+            "is_protected": is_prot,
             "is_active": (acc_name.lower() == reg["auto_login_user"].lower()),
             "installed_count": inst_count,
             "total_count": len(acc_games)
@@ -2182,6 +3349,7 @@ def build_full_state():
         "steam_path": steam_path,
         "logo_src": LOGO_B64_URI,
         "accounts": accounts_list,
+        "protected_accounts": prot_list,
         "games": games_list,
         "window_state": load_window_state(),
         "cloud_config": load_cloud_config()
@@ -2279,6 +3447,76 @@ def stop_steam_fast():
             break
         time.sleep(0.15)
 
+def launch_local_game(appid, game_name="", conflict_choice=""):
+    """Launch a registered Local (Non-Steam) game directly, with Cloud Save pre-sync and real-time Emulator Achievement tracking."""
+    aid_s = str(appid).strip()
+    local_games = load_local_games()
+    lg = local_games.get(aid_s)
+    if not lg:
+        return False, "Data game lokal tidak ditemukan!"
+
+    exe_path = lg.get("exe_path", "")
+    install_dir = lg.get("install_dir", "")
+    if (not exe_path or not os.path.isfile(exe_path)) and install_dir and os.path.isdir(install_dir):
+        exe_path = _find_best_exe_in_folder(install_dir)
+        if exe_path:
+            lg["exe_path"] = exe_path
+            local_games[aid_s] = lg
+            save_local_games(local_games)
+
+    if not exe_path or not os.path.isfile(exe_path):
+        return False, "File .exe game lokal tidak ditemukan! Silakan periksa pengaturannya."
+
+    reg = get_steam_registry_info()
+    steam_path = reg["steam_path"]
+    acc_info = {"account_name": "LOCAL", "persona_name": "Game Lokal", "steamid3": "", "steamid64": ""}
+    gtitle = game_name or lg.get("name") or f"App {aid_s}"
+
+    # 1. Pre-Launch Cloud Save Smart Sync (if enabled)
+    sync_note = ""
+    cloud_cfg = load_cloud_config()
+    if is_game_cloud_enabled(aid_s) and cloud_cfg.get("server_url") and cloud_cfg.get("username") and cloud_cfg.get("auto_sync", True):
+        if conflict_choice == "local":
+            ok_s, action_s, msg_s = sync_game_save(steam_path, aid_s, acc_info, gtitle, direction="upload")
+        elif conflict_choice == "cloud":
+            ok_s, action_s, msg_s = sync_game_save(steam_path, aid_s, acc_info, gtitle, direction="download")
+        else:
+            ok_s, action_s, msg_s = sync_game_save(steam_path, aid_s, acc_info, gtitle, direction="auto", check_conflict=True)
+            if action_s == "conflict" and isinstance(msg_s, dict):
+                msg_s["account"] = "LOCAL"
+                return True, {"conflict": True, **msg_s}
+        if action_s in ("downloaded", "uploaded") and isinstance(msg_s, str):
+            sync_note = f" • {msg_s}"
+
+    # 2. Ensure schema is cached & sync personal achievements into emulator ini/json before launching
+    parse_game_achievement_schema(steam_path, aid_s, allow_remote=True)
+    capture_new_achievements_from_steam_bin(steam_path, "", aid_s, session_start_ts=0, game_name=gtitle, trigger_popup=False)
+    apply_personal_achievements_to_steam_bin(steam_path, "", aid_s)
+
+    # 3. Launch .exe directly without restarting/switching Steam
+    try:
+        work_dir = os.path.dirname(exe_path) or install_dir or None
+        proc = subprocess.Popen(
+            [exe_path],
+            cwd=work_dir,
+            close_fds=True,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        LOCAL_GAME_PROCS[aid_s] = proc
+        LAUNCHING_UNTIL[aid_s] = time.time() + 12
+        lg["last_played"] = int(time.time())
+        local_games[aid_s] = lg
+        save_local_games(local_games)
+
+        threading.Thread(
+            target=watch_game_and_auto_upload,
+            args=(steam_path, aid_s, acc_info, gtitle),
+            daemon=True
+        ).start()
+        return True, f"Menjalankan {gtitle} (Game Lokal)!{sync_note}"
+    except Exception as e:
+        return False, f"Gagal menjalankan file game lokal: {e}"
+
 def switch_and_launch(target_account, appid=None, install_mode=False, game_name="", conflict_choice=""):
     reg = get_steam_registry_info()
     steam_path = reg["steam_path"]
@@ -2325,9 +3563,12 @@ def switch_and_launch(target_account, appid=None, install_mode=False, game_name=
         if not ok:
             return False, msg
 
-    # 3. Isolate local Steam achievement bin to match user's personal achievements before launching game
+    # 3. For unprotected Offline/Sharing accounts, isolate local Steam achievement bin; for Protected or Online accounts, import safely without overwriting!
     if appid and not install_mode:
-        apply_personal_achievements_to_steam_bin(steam_path, acc_info.get("steamid3", ""), appid)
+        if not is_account_protected_from_overwrite(acc_info):
+            apply_personal_achievements_to_steam_bin(steam_path, acc_info.get("steamid3", ""), appid)
+        else:
+            capture_new_achievements_from_steam_bin(steam_path, acc_info.get("steamid3", ""), appid, session_start_ts=0, game_name=game_name, trigger_popup=False)
 
     # 4. Launch Game or Steam
     if appid:
@@ -2510,6 +3751,19 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             game_name = payload.get("game_name", "").strip()
             install_mode = bool(payload.get("install_mode", False))
             conflict_choice = payload.get("conflict_choice", "").strip()
+
+            local_games = load_local_games()
+            if appid and (account == "LOCAL" or appid in local_games):
+                reg_chk = get_steam_registry_info()
+                inst_chk = get_installed_games(reg_chk["steam_path"]).get(appid)
+                if account == "LOCAL" or not inst_chk or inst_chk.get("is_local"):
+                    ok, msg = launch_local_game(appid, game_name=game_name, conflict_choice=conflict_choice)
+                    if isinstance(msg, dict) and msg.get("conflict"):
+                        self.send_json({"ok": True, **msg})
+                        return
+                    self.send_json({"ok": ok, "message": msg})
+                    return
+
             if not account:
                 self.send_json({"ok": False, "message": "Akun Steam belum dipilih!"}, 400)
                 return
@@ -2575,7 +3829,7 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             sid3 = acc_info.get("steamid3", "")
 
             pers_map = get_game_personal_achievements(appid)
-            schema = parse_game_achievement_schema(steam_path, appid)
+            schema = parse_game_achievement_schema(steam_path, appid, allow_remote=True)
             schema_by_key = {item["key"]: item for item in schema}
 
             if action == "test_popup":
@@ -2843,6 +4097,149 @@ class LauncherRequestHandler(BaseHTTPRequestHandler):
             installed = get_installed_games(steam_path)
             p_info = get_game_patch_info(appid, game_name, installed.get(appid))
             self.send_json({"ok": ok_p, "message": msg_p, **p_info})
+            return
+
+        if self.path == "/api/pick_local_file":
+            init_dir = str(payload.get("initial_dir") or "").strip()
+            picked = pick_exe_file_dialog(init_dir)
+            self.send_json({"ok": True, "path": picked})
+            return
+
+        if self.path == "/api/pick_local_folder":
+            title = str(payload.get("title") or "Pilih Folder").strip()
+            picked = pick_folder_dialog(title)
+            self.send_json({"ok": True, "path": picked})
+            return
+
+        if self.path == "/api/detect_local_game":
+            path_in = str(payload.get("path") or "").strip()
+            appid_or_url = str(payload.get("appid_or_url") or "").strip()
+            reg = get_steam_registry_info()
+            meta = detect_local_game_metadata(reg["steam_path"], path_in, appid_or_url)
+            self.send_json({"ok": True, **meta})
+            return
+
+        if self.path == "/api/save_local_game":
+            raw_path = str(payload.get("exe_path") or "").strip().strip('"')
+            appid_in = str(payload.get("appid_or_url") or payload.get("appid") or "").strip()
+            custom_name = str(payload.get("name") or "").strip()
+            custom_save_dir = str(payload.get("save_dir") or "").strip().strip('"')
+            old_appid = str(payload.get("old_appid") or "").strip()
+
+            if not raw_path:
+                self.send_json({"ok": False, "message": "Lokasi file .exe atau folder game wajib diisi!"}, 400)
+                return
+
+            reg = get_steam_registry_info()
+            steam_path = reg["steam_path"]
+            meta = detect_local_game_metadata(steam_path, raw_path, appid_in)
+
+            exe_path = meta["exe_path"]
+            install_dir = meta["install_dir"]
+            if not exe_path or not os.path.isfile(exe_path):
+                self.send_json({"ok": False, "message": "File .exe game tidak ditemukan pada lokasi tersebut!"}, 400)
+                return
+
+            appid = _extract_appid_from_input(appid_in) or meta["appid"]
+            if not appid or not appid.isdigit():
+                self.send_json({
+                    "ok": False,
+                    "message": "Steam AppID belum terdeteksi otomatis. Silakan tempel Link Steam Store atau masukkan angka AppID game tersebut."
+                }, 400)
+                return
+
+            final_name = custom_name or meta["name"] or f"App {appid}"
+            final_save_dir = os.path.normpath(custom_save_dir) if custom_save_dir else meta["save_dir"]
+
+            local_games = load_local_games()
+            prev_entry = local_games.get(appid, {})
+            if old_appid and old_appid != appid and old_appid in local_games:
+                local_games.pop(old_appid, None)
+
+            local_games[appid] = {
+                "appid": appid,
+                "name": final_name,
+                "exe_path": os.path.normpath(exe_path),
+                "install_dir": os.path.normpath(install_dir),
+                "save_dir": final_save_dir,
+                "emu_type": meta["emu_type"],
+                "added_at": int(prev_entry.get("added_at") or time.time()),
+                "last_played": int(prev_entry.get("last_played") or 0),
+            }
+            save_local_games(local_games)
+
+            # Fetch achievement schema & import any already-unlocked emulator achievements immediately
+            schema = parse_game_achievement_schema(steam_path, appid, allow_remote=True)
+            capture_new_achievements_from_steam_bin(steam_path, "", appid, session_start_ts=0, game_name=final_name, trigger_popup=False)
+            ensure_local_game_assets_async(steam_path, appid)
+            build_full_state()
+
+            self.send_json({
+                "ok": True,
+                "appid": appid,
+                "ach_total": len(schema),
+                "message": f"Game lokal '{final_name}' (AppID {appid} • {len(schema)} Achievement) berhasil disimpan!"
+            })
+            return
+
+        if self.path == "/api/remove_local_game":
+            appid = str(payload.get("appid") or "").strip()
+            local_games = load_local_games()
+            removed = local_games.pop(appid, None)
+            save_local_games(local_games)
+            build_full_state()
+            gtitle = (removed or {}).get("name") or f"App {appid}"
+            self.send_json({"ok": True, "message": f"'{gtitle}' dihapus dari daftar Game Lokal (file game di PC tetap aman)."})
+            return
+
+        if self.path == "/api/open_local_folder":
+            appid = str(payload.get("appid") or "").strip()
+            target_kind = str(payload.get("kind") or "game").strip()
+            lg = load_local_games().get(appid, {})
+            folder = lg.get("save_dir", "") if target_kind == "save" else (lg.get("install_dir") or os.path.dirname(lg.get("exe_path", "")))
+            if folder and os.path.isdir(folder):
+                try:
+                    os.startfile(folder)
+                    self.send_json({"ok": True})
+                    return
+                except Exception as e:
+                    self.send_json({"ok": False, "message": f"Gagal membuka folder: {e}"}, 500)
+                    return
+            self.send_json({"ok": False, "message": "Folder tidak ditemukan di komputer ini."}, 404)
+            return
+
+        if self.path == "/api/protected_accounts":
+            reg = get_steam_registry_info()
+            cur_set = set(load_protected_accounts(reg["steam_path"]))
+            action = str(payload.get("action") or "set").strip()
+            acc_val = str(payload.get("account") or "").strip().lower()
+
+            if action == "add" and acc_val:
+                cur_set.add(acc_val)
+                saved = save_protected_accounts(list(cur_set))
+                msg_p = f"Akun '{acc_val}' ditambahkan ke daftar proteksi achievement!"
+            elif action == "remove" and acc_val:
+                cur_set.discard(acc_val)
+                saved = save_protected_accounts(list(cur_set))
+                msg_p = f"Akun '{acc_val}' dihapus dari daftar proteksi manual."
+            elif action == "toggle" and acc_val:
+                enabled = bool(payload.get("protected", True))
+                if enabled:
+                    cur_set.add(acc_val)
+                    msg_p = f"Proteksi achievement diaktifkan untuk '{acc_val}'!"
+                else:
+                    cur_set.discard(acc_val)
+                    msg_p = f"Proteksi manual dilepas untuk '{acc_val}'."
+                saved = save_protected_accounts(list(cur_set))
+            elif isinstance(payload.get("accounts"), list):
+                saved = save_protected_accounts(payload["accounts"])
+                msg_p = "Daftar akun terproteksi berhasil disimpan!"
+            else:
+                saved = sorted(list(cur_set))
+                msg_p = "OK"
+
+            build_full_state()
+            self.send_json({"ok": True, "protected_accounts": saved, "message": msg_p})
             return
 
         self.send_error(404)

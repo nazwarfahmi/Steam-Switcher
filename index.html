@@ -1234,6 +1234,9 @@
       </div>
 
       <div class="topbar-right">
+        <button class="icon-btn" onclick="openLocalGameModal()" title="Tambah Game Lokal (Non-Steam) + Pelacak Achievement">
+          + Game Lokal
+        </button>
         <button class="icon-btn" id="cloudBtn" onclick="openCloudModal()" title="Akun Cloud Save">
           ☁ Login Cloud
         </button>
@@ -1395,24 +1398,129 @@
 
   <!-- APP SETTINGS MODAL -->
   <div class="modal-backdrop" id="settingsModal" onclick="if(event.target===this)closeSettingsModal()">
-    <div class="modal-box" style="width:430px;">
+    <div class="modal-box" style="width:490px;max-width:94vw;max-height:88vh;display:flex;flex-direction:column;">
       <h2>Pengaturan Aplikasi</h2>
-      <label class="setting-row" for="chkHideToTray">
-        <div class="setting-info">
-          <div class="setting-title">On exit hide to tray</div>
-          <div class="setting-desc">Saat tombol X diklik, sembunyikan aplikasi ke System Tray Windows.</div>
+      <div style="overflow-y:auto;padding-right:4px;flex:1;">
+        <label class="setting-row" for="chkHideToTray">
+          <div class="setting-info">
+            <div class="setting-title">On exit hide to tray</div>
+            <div class="setting-desc">Saat tombol X diklik, sembunyikan aplikasi ke System Tray Windows.</div>
+          </div>
+          <input type="checkbox" class="setting-check" id="chkHideToTray" onchange="saveAppSettings()" />
+        </label>
+        <label class="setting-row" for="chkStartupTray">
+          <div class="setting-info">
+            <div class="setting-title">Start at Windows startup (tray)</div>
+            <div class="setting-desc">Jalankan otomatis di System Tray saat komputer dinyalakan.</div>
+          </div>
+          <input type="checkbox" class="setting-check" id="chkStartupTray" onchange="saveAppSettings()" />
+        </label>
+
+        <div style="margin-top:14px;padding-top:13px;border-top:1px solid var(--border);">
+          <div style="font-size:13.5px;font-weight:700;color:var(--text-main);margin-bottom:4px;">
+            🛡️ Proteksi Achievement Akun Pribadi (Anti-Timpa)
+          </div>
+          <div style="font-size:11.5px;color:var(--text-muted);line-height:1.45;margin-bottom:10px;">
+            Daftar username/akun Steam yang <strong>dilarang keras</strong> ditimpa atau direset file achievement-nya oleh aplikasi (aman 100% baik saat Mode Online maupun Offline).
+          </div>
+
+          <div style="display:flex;gap:7px;margin-bottom:10px;">
+            <input
+              type="text"
+              id="protAccInput"
+              style="flex:1;padding:8px 11px;border-radius:7px;border:1px solid var(--border);background:var(--bg-input);color:var(--text-main);font-size:12.5px;outline:none;"
+              placeholder="Ketik username akun Steam..."
+              onkeydown="if(event.key==='Enter'){event.preventDefault();addProtectedAccountManual();}"
+            />
+            <button
+              class="icon-btn"
+              type="button"
+              style="background:var(--btn-primary-bg);color:var(--btn-primary-text);flex-shrink:0;"
+              onclick="addProtectedAccountManual()"
+            >+ Tambah</button>
+          </div>
+
+          <div id="protectedAccountsListBox" style="display:flex;flex-direction:column;gap:6px;"></div>
         </div>
-        <input type="checkbox" class="setting-check" id="chkHideToTray" onchange="saveAppSettings()" />
-      </label>
-      <label class="setting-row" for="chkStartupTray">
-        <div class="setting-info">
-          <div class="setting-title">Start at Windows startup (tray)</div>
-          <div class="setting-desc">Jalankan otomatis di System Tray saat komputer dinyalakan.</div>
-        </div>
-        <input type="checkbox" class="setting-check" id="chkStartupTray" onchange="saveAppSettings()" />
-      </label>
+      </div>
+
       <div class="modal-footer" style="justify-content:flex-end;">
         <button class="icon-btn" onclick="closeSettingsModal()">Tutup</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ADD / EDIT LOCAL GAME MODAL (NON-STEAM) -->
+  <div class="modal-backdrop" id="localGameModal" onclick="if(event.target===this)closeLocalGameModal()">
+    <div class="modal-box" style="width:500px;max-width:94vw;">
+      <h2 id="localGameModalTitle">Tambah Game Lokal (Non-Steam)</h2>
+      <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:13px;line-height:1.45;">
+        Tetap dapatkan <strong>Achievement Resmi Steam</strong> (beserta ikon &amp; popup notifikasi saat main) dan <strong>Cloud Save</strong> untuk game lokal Anda.
+      </div>
+
+      <input type="hidden" id="localOldAppIdInput" value="" />
+
+      <div class="field">
+        <label>File .exe atau Folder Game Lokal</label>
+        <div style="display:flex;gap:7px;">
+          <input
+            type="text"
+            id="localExeInput"
+            placeholder="Contoh: E:\Games\Stoneshard\StoneShard.exe"
+            onchange="detectLocalGameInfo()"
+          />
+          <button class="icon-btn" type="button" style="flex-shrink:0;" onclick="pickLocalExe()">📂 Pilih .exe</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Steam AppID atau Link Store Steam (Otomatis Terdeteksi)</label>
+        <div style="display:flex;gap:7px;">
+          <input
+            type="text"
+            id="localAppIdInput"
+            placeholder="Contoh: 625960 atau https://store.steampowered.com/app/625960/..."
+            onchange="detectLocalGameInfo(true)"
+          />
+          <button class="icon-btn" type="button" style="flex-shrink:0;" onclick="detectLocalGameInfo(true)">🔍 Cek</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Nama Game</label>
+        <input type="text" id="localNameInput" placeholder="Otomatis terisi dari Steam..." />
+      </div>
+
+      <div class="field">
+        <label>Folder Save Game (Opsional — untuk Cloud Save)</label>
+        <div style="display:flex;gap:7px;">
+          <input type="text" id="localSaveDirInput" placeholder="Otomatis dicari di AppData / Documents / Emulator..." />
+          <button class="icon-btn" type="button" style="flex-shrink:0;" onclick="pickLocalSaveFolder()">📂 Folder</button>
+        </div>
+      </div>
+
+      <div id="localDetectBanner" style="display:none;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-base);font-size:11.5px;color:var(--text-muted);margin-top:4px;line-height:1.4;"></div>
+
+      <div class="modal-footer" style="flex-wrap:wrap;gap:8px;">
+        <div>
+          <button
+            class="icon-btn"
+            id="btnRemoveLocalGame"
+            type="button"
+            style="display:none;border-color:rgba(239,68,68,0.45);color:#ef4444;"
+            onclick="removeLocalGameNow()"
+          >🗑 Hapus dari Daftar</button>
+        </div>
+        <div style="display:flex;gap:7px;margin-left:auto;">
+          <button class="icon-btn" type="button" onclick="closeLocalGameModal()">Batal</button>
+          <button
+            class="icon-btn"
+            id="btnSaveLocalGame"
+            type="button"
+            style="background:var(--btn-primary-bg);color:var(--btn-primary-text);"
+            onclick="submitLocalGame()"
+          >Simpan Game</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1493,7 +1601,131 @@
       const ws = appState.window_state || {};
       document.getElementById("chkHideToTray").checked = ws.hide_to_tray_on_exit !== false;
       document.getElementById("chkStartupTray").checked = Boolean(ws.start_at_startup_tray);
+      renderProtectedAccountsSettings();
       document.getElementById("settingsModal").classList.add("show");
+    }
+
+    function renderProtectedAccountsSettings() {
+      const box = document.getElementById("protectedAccountsListBox");
+      if (!box) return;
+      const protList = (appState.protected_accounts || []).map(x => String(x).toLowerCase());
+      const protSet = new Set(protList);
+      const knownNamesLower = new Set();
+
+      let rowsHtml = "";
+      for (const acc of (appState.accounts || [])) {
+        const uname = acc.account_name;
+        const unameLow = uname.toLowerCase();
+        knownNamesLower.add(unameLow);
+        const isChecked = protSet.has(unameLow) || Boolean(acc.is_protected);
+        const safeU = uname.replace(/'/g, "\\'");
+        const personaNote = (acc.persona_name && acc.persona_name.toLowerCase() !== unameLow) ? ` (${acc.persona_name})` : "";
+        rowsHtml += `
+          <label class="setting-row" style="margin-bottom:0;padding:9px 12px;">
+            <div class="setting-info" style="min-width:0;">
+              <div class="setting-title" style="font-size:12.5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                <span>${uname}${personaNote}</span>
+                ${isChecked
+                  ? '<span class="badge-used" style="font-size:10px;padding:1px 7px;">🛡️ Terproteksi</span>'
+                  : '<span style="font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid var(--border);color:var(--text-muted);">Isolasi Sharing</span>'}
+              </div>
+              <div class="setting-desc">Mode saat ini: ${acc.offline_mode ? 'Offline' : 'Online'}</div>
+            </div>
+            <input
+              type="checkbox"
+              class="setting-check"
+              ${isChecked ? "checked" : ""}
+              onchange="toggleProtectedAccount('${safeU}', this.checked)"
+            />
+          </label>
+        `;
+      }
+
+      // Render any manually added usernames not currently in loginusers.vdf
+      for (const customName of protList) {
+        if (knownNamesLower.has(customName)) continue;
+        const safeC = customName.replace(/'/g, "\\'");
+        rowsHtml += `
+          <div class="setting-row" style="margin-bottom:0;padding:9px 12px;cursor:default;">
+            <div class="setting-info">
+              <div class="setting-title" style="font-size:12.5px;display:flex;align-items:center;gap:6px;">
+                <span>${customName}</span>
+                <span class="badge-used" style="font-size:10px;padding:1px 7px;">🛡️ Terproteksi (Manual)</span>
+              </div>
+            </div>
+            <button class="btn-mini" style="color:#ef4444;border-color:rgba(239,68,68,0.4);" onclick="removeProtectedAccountManual('${safeC}')">Hapus</button>
+          </div>
+        `;
+      }
+
+      if (!rowsHtml) {
+        rowsHtml = `<div style="padding:10px;text-align:center;font-size:11.5px;color:var(--text-muted);">Belum ada akun terdaftar.</div>`;
+      }
+      box.innerHTML = rowsHtml;
+    }
+
+    async function toggleProtectedAccount(accountName, isProtected) {
+      try {
+        const res = await fetch("/api/protected_accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "toggle", account: accountName, protected: isProtected })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          appState.protected_accounts = data.protected_accounts || [];
+          await refreshState();
+          renderProtectedAccountsSettings();
+          showToast(data.message || "Pengaturan proteksi diperbarui!", 2500);
+        }
+      } catch (e) {
+        showToast("Gagal menyimpan proteksi akun.");
+      }
+    }
+
+    async function addProtectedAccountManual() {
+      const inp = document.getElementById("protAccInput");
+      const val = (inp ? inp.value : "").trim().toLowerCase();
+      if (!val) {
+        showToast("Ketik username akun Steam terlebih dahulu.");
+        return;
+      }
+      try {
+        const res = await fetch("/api/protected_accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "add", account: val })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          if (inp) inp.value = "";
+          appState.protected_accounts = data.protected_accounts || [];
+          await refreshState();
+          renderProtectedAccountsSettings();
+          showToast(data.message || "Username ditambahkan ke proteksi!", 2500);
+        }
+      } catch (e) {
+        showToast("Gagal menambahkan akun ke proteksi.");
+      }
+    }
+
+    async function removeProtectedAccountManual(accountName) {
+      try {
+        const res = await fetch("/api/protected_accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "remove", account: accountName })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          appState.protected_accounts = data.protected_accounts || [];
+          await refreshState();
+          renderProtectedAccountsSettings();
+          showToast(data.message || "Username dihapus dari proteksi.", 2500);
+        }
+      } catch (e) {
+        showToast("Gagal menghapus username.");
+      }
     }
 
     function closeSettingsModal() {
@@ -1538,7 +1770,12 @@
       }
       appState.accounts.sort((a, b) => a.account_name.localeCompare(b.account_name, undefined, { sensitivity: "base" }));
       appState.games.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
-      if (selectedAccount !== "ALL" && !appState.accounts.some(a => a.account_name === selectedAccount)) {
+      const hasLocalGames = appState.games.some(g => g.is_local);
+      if (
+        selectedAccount !== "ALL" &&
+        !(selectedAccount === "LOCAL" && hasLocalGames) &&
+        !appState.accounts.some(a => a.account_name === selectedAccount)
+      ) {
         selectedAccount = "ALL";
       }
       const cbtn = document.getElementById("cloudBtn");
@@ -1565,25 +1802,41 @@
 
       const listEl = document.getElementById("accountList");
       const totalInst = appState.games.filter(g => g.installed).length;
+      const localGamesList = appState.games.filter(g => g.is_local);
 
       let html = `
         <div class="account-item ${selectedAccount === 'ALL' ? 'selected' : ''}" onmousedown="selectAccount('ALL')" onclick="selectAccount('ALL')">
           <div class="acc-top">
-            <div class="acc-name">Semua Akun</div>
+            <div class="acc-name">Semua Game</div>
             <span class="acc-count-pill">${totalInst} / ${appState.games.length}</span>
           </div>
         </div>
       `;
 
+      if (localGamesList.length > 0) {
+        html += `
+          <div class="account-item ${selectedAccount === 'LOCAL' ? 'selected' : ''}" onmousedown="selectAccount('LOCAL')" onclick="selectAccount('LOCAL')">
+            <div class="acc-top">
+              <div class="acc-name">
+                <span>💾 Game Lokal</span>
+              </div>
+              <span class="acc-count-pill">${localGamesList.length}</span>
+            </div>
+          </div>
+        `;
+      }
+
       for (const acc of appState.accounts) {
         const isSel = selectedAccount === acc.account_name;
         const isCurrent = acc.is_active;
+        const isProt = Boolean(acc.is_protected);
         html += `
           <div class="account-item ${isSel ? 'selected' : ''}" onmousedown="selectAccount('${acc.account_name}')" onclick="selectAccount('${acc.account_name}')">
             <div class="acc-top">
               <div class="acc-name">
                 ${isCurrent ? '<span class="active-dot" title="Akun Aktif"></span>' : ''}
-                <span>${acc.account_name}</span>
+                <span style="overflow:hidden;text-overflow:ellipsis;">${acc.account_name}</span>
+                ${isProt ? '<span title="Achievement Akun Terproteksi (Anti-Timpa)" style="font-size:11px;flex-shrink:0;">🛡️</span>' : ''}
               </div>
               <span class="acc-count-pill">${acc.installed_count} / ${acc.total_count}</span>
             </div>
@@ -1618,13 +1871,16 @@
       const titleEl = document.getElementById("currentViewTitle");
 
       if (selectedAccount === "ALL") {
-        titleEl.textContent = "Daftar Game (Semua Akun)";
+        titleEl.textContent = "Daftar Game (Semua)";
+      } else if (selectedAccount === "LOCAL") {
+        titleEl.textContent = "Daftar Game Lokal (Non-Steam)";
       } else {
         titleEl.textContent = `Daftar Game (${selectedAccount})`;
       }
 
       let finalGames = appState.games.filter(g => {
         if (selectedAccount === "ALL") return true;
+        if (selectedAccount === "LOCAL") return Boolean(g.is_local);
         return g.owner_account === selectedAccount;
       });
 
@@ -1669,6 +1925,8 @@
           ? `<span class="badge-patched-pill" style="background:rgba(37,99,235,0.92);border-color:#60a5fa;"><span class="running-dot"></span> RUNNING</span>`
           : (isUp ? `<span class="badge-patched-pill" style="background:rgba(2,132,199,0.92);border-color:#38bdf8;"><span class="running-dot"></span> CLOUD SYNC</span>` : "");
 
+        const ownerBadgeLabel = g.is_local ? "💾 Game Lokal" : g.owner_account;
+
         return `
           <div class="game-card ${stateClass}" data-appid="${g.appid}" onclick="openGamePage('${g.appid}')">
             <div class="poster-wrap">
@@ -1682,7 +1940,7 @@
               <div class="badges-top-left">
                 <span class="badge-profile ${profilePatchClass}">
                   ${patchIconHtml}
-                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${g.owner_account}</span>
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${ownerBadgeLabel}</span>
                 </span>
                 ${patchedTagHtml}
                 ${runPillHtml}
@@ -1740,7 +1998,7 @@
       const aid = String(appid);
       activeGamePageAppId = aid;
       const gObj = appState.games.find(x => String(x.appid) === aid) || { appid: aid, name: `App ${aid}` };
-      const targetAccount = (selectedAccount !== "ALL") ? selectedAccount : (gObj.owner_account || "");
+      const targetAccount = gObj.is_local ? "LOCAL" : ((selectedAccount !== "ALL" && selectedAccount !== "LOCAL") ? selectedAccount : (gObj.owner_account || ""));
       const gameName = gObj.name || `App ${aid}`;
 
       activeAchContext = { appid: aid, account: targetAccount, gameName };
@@ -1819,7 +2077,8 @@
       const patchCard = document.getElementById("detailPatchCard");
       if (!g || !mainCard || !patchCard) return;
 
-      const targetAccount = (selectedAccount !== "ALL") ? selectedAccount : (g.owner_account || "");
+      const isLocalGame = Boolean(g.is_local);
+      const targetAccount = isLocalGame ? "LOCAL" : ((selectedAccount !== "ALL" && selectedAccount !== "LOCAL") ? selectedAccount : (g.owner_account || ""));
       const accObj = (appState.accounts || []).find(a => a.account_name === targetAccount) || {};
       const isOfflineMode = Boolean(accObj.offline_mode);
       const offlineChecked = isOfflineMode ? "checked" : "";
@@ -1832,16 +2091,69 @@
       const posterFallback = `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.appid}/header.jpg`;
       const driveInfo = isInstalled
         ? `${g.drive || "-"} • ${g.size_gb ? g.size_gb + " GB" : "Terinstal"}`
-        : "Belum Terinstal di PC ini";
+        : (isLocalGame ? "File .exe Tidak Ditemukan" : "Belum Terinstal di PC ini");
 
       let playBtnClass = isRunning ? "is-running" : (isUploading ? "is-uploading" : "");
       let playBtnContent = isRunning
         ? `<span class="running-dot"></span><span>Sedang Berjalan</span>`
         : (isUploading
           ? `<span class="running-dot"></span><span>Upload Save...</span>`
-          : (isInstalled ? `▶ Mainkan Sekarang` : `⬇ Install via Steam`));
+          : (isInstalled ? `▶ Mainkan Sekarang` : (isLocalGame ? `⚙ Atur Lokasi .exe` : `⬇ Install via Steam`)));
 
       const steamSvgIcon = `<svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.979 0C5.678 0 .511 4.86.022 11.037l6.432 2.658c.545-.371 1.203-.59 1.912-.59.063 0 .125.004.188.006l2.861-4.142V8.91c0-2.495 2.028-4.524 4.524-4.524 2.494 0 4.524 2.031 4.524 4.527s-2.03 4.525-4.524 4.525h-.105l-4.076 2.911c0 .052.004.105.004.159 0 1.875-1.515 3.396-3.39 3.396-1.635 0-3.016-1.173-3.331-2.727L.436 15.27C1.862 20.307 6.486 24 11.979 24c6.627 0 11.999-5.373 11.999-12S18.605 0 11.979 0zM7.54 18.21l-1.473-.61c.262.543.714.999 1.314 1.25 1.297.539 2.793-.076 3.332-1.375.263-.63.264-1.319.005-1.949s-.75-1.121-1.377-1.383c-.624-.26-1.29-.249-1.878-.03l1.523.63c.956.4 1.409 1.5 1.009 2.455-.397.957-1.497 1.41-2.455 1.012zm11.415-9.303c0-1.662-1.353-3.015-3.015-3.015-1.665 0-3.015 1.353-3.015 3.015 0 1.665 1.35 3.015 3.015 3.015 1.663 0 3.015-1.35 3.015-3.015zm-5.273-.005c0-1.252 1.013-2.266 2.265-2.266 1.249 0 2.266 1.014 2.266 2.266 0 1.251-1.017 2.265-2.266 2.265-1.252 0-2.265-1.014-2.265-2.265z"/></svg>`;
+
+      const playOnclick = (isLocalGame && !isInstalled)
+        ? `openLocalGameModal('${g.appid}')`
+        : `launchGame('${g.appid}', '${targetAccount}', ${!isInstalled}, '${safeName}')`;
+
+      const sideActionButtonsHtml = isLocalGame
+        ? `
+          <button
+            class="icon-btn"
+            style="padding:0 11px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;"
+            title="Buka Folder Instalasi Game"
+            onclick="openLocalFolder('${g.appid}', 'game')"
+          >📂</button>
+          <button
+            class="icon-btn"
+            style="padding:0 11px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;"
+            title="Edit atau Hapus Game Lokal"
+            onclick="openLocalGameModal('${g.appid}')"
+          >⚙</button>
+        `
+        : `
+          <button
+            class="icon-btn"
+            style="padding:0 13px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;"
+            title="Buka Steam dengan akun ${targetAccount}"
+            onclick="switchAccountOnly('${targetAccount}')"
+          >${steamSvgIcon}</button>
+        `;
+
+      const bottomRowHtml = isLocalGame
+        ? `
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <span style="font-size:12px;color:var(--text-muted);font-weight:600;">🎯 Emulator / Tracker</span>
+            <span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;border:1px solid rgba(34,197,94,0.45);background:rgba(34,197,94,0.12);color:#4ade80;">
+              ${g.emu_type || "Aktif"}
+            </span>
+          </div>
+        `
+        : `
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+            <label class="cloud-check-row" style="font-size:12.5px;">
+              <input
+                type="checkbox"
+                ${offlineChecked}
+                onchange="toggleOfflineMode('${targetAccount}', this.checked)"
+              />
+              <span>Main Mode Offline</span>
+            </label>
+            <span style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--border);background:var(--bg-base);color:${isOfflineMode ? 'var(--text-muted)' : '#22c55e'};">
+              ${isOfflineMode ? 'Offline' : 'Online'}
+            </span>
+          </div>
+        `;
 
       mainCard.innerHTML = `
         <div class="detail-hero-top">
@@ -1854,26 +2166,21 @@
           <div class="detail-hero-info">
             <div class="detail-game-title">${g.name}</div>
             <div class="detail-meta-list">
-              <div>👤 Akun: <strong style="color:var(--text-main);">${targetAccount || "-"}</strong></div>
+              <div>${isLocalGame ? '📦 Sumber: <strong style="color:var(--text-main);">Game Lokal (Non-Steam)</strong>' : `👤 Akun: <strong style="color:var(--text-main);">${targetAccount || "-"}${accObj.is_protected ? ' 🛡️' : ''}</strong>`}</div>
               <div>💾 Status: <strong style="color:var(--text-main);">${driveInfo}</strong></div>
               <div>🆔 AppID: <strong style="color:var(--text-main);">${g.appid}</strong></div>
             </div>
           </div>
         </div>
 
-        <div style="display:flex;align-items:stretch;gap:8px;">
+        <div style="display:flex;align-items:stretch;gap:7px;">
           <button
             id="btn-detail-play-${g.appid}"
             class="btn-play-main ${playBtnClass}"
             style="flex:1;padding:11px 14px;font-size:13.5px;border-radius:9px;"
-            onclick="launchGame('${g.appid}', '${targetAccount}', ${!isInstalled}, '${safeName}')"
+            onclick="${playOnclick}"
           >${playBtnContent}</button>
-          <button
-            class="icon-btn"
-            style="padding:0 13px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;"
-            title="Buka Steam dengan akun ${targetAccount}"
-            onclick="switchAccountOnly('${targetAccount}')"
-          >${steamSvgIcon}</button>
+          ${sideActionButtonsHtml}
         </div>
 
         <div style="display:flex;flex-direction:column;gap:8px;padding-top:6px;border-top:1px solid var(--border);">
@@ -1894,19 +2201,7 @@
             >☁</button>
           </div>
 
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-            <label class="cloud-check-row" style="font-size:12.5px;">
-              <input
-                type="checkbox"
-                ${offlineChecked}
-                onchange="toggleOfflineMode('${targetAccount}', this.checked)"
-              />
-              <span>Main Mode Offline</span>
-            </label>
-            <span style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--border);background:var(--bg-base);color:${isOfflineMode ? 'var(--text-muted)' : '#22c55e'};">
-              ${isOfflineMode ? 'Offline' : 'Online'}
-            </span>
-          </div>
+          ${bottomRowHtml}
         </div>
       `;
 
@@ -2079,21 +2374,26 @@
     }
 
     async function launchGame(appid, account, installMode, gameName, conflictChoice = "") {
-      if (!account) {
+      const gObj = appState.games.find(x => String(x.appid) === String(appid));
+      const isLocal = Boolean((gObj && gObj.is_local) || account === "LOCAL");
+      if (!account && !isLocal) {
         showToast("Akun tidak ditemukan untuk game ini!");
         return;
       }
-      const gObj = appState.games.find(x => String(x.appid) === String(appid));
       if (gObj && gObj.running && !conflictChoice) {
-        showToast(`${gameName} sedang berjalan (Running) di Steam.`, 3000);
+        showToast(`${gameName} sedang berjalan (Running).`, 3000);
         return;
       }
       if (gObj && gObj.uploading && !conflictChoice) {
         showToast(`Sedang meng-upload save ${gameName} ke Cloud...`, 3000);
         return;
       }
-      const actionWord = installMode ? "Membuka Install" : "Sinkronisasi Save & Menjalankan";
-      showToast(`Mengatur akun '${account}' • ${actionWord} ${gameName}...`, 5000);
+      if (isLocal) {
+        showToast(`Menjalankan ${gameName} (Game Lokal)...`, 4000);
+      } else {
+        const actionWord = installMode ? "Membuka Install" : "Sinkronisasi Save & Menjalankan";
+        showToast(`Mengatur akun '${account}' • ${actionWord} ${gameName}...`, 5000);
+      }
 
       try {
         const res = await fetch("/api/launch", {
@@ -2163,11 +2463,11 @@
         if (banner) {
           banner.style.display = "flex";
           if (!localSave.exists) {
-            banner.innerHTML = `<span>Folder Save Steam: <strong>Belum ada file save di PC ini</strong></span>`;
+            banner.innerHTML = `<span>Folder Save Lokal: <strong>Belum ada file save di PC ini</strong></span>`;
           } else if (localSave.matched && localSave.matched_index) {
-            banner.innerHTML = `<span>Folder Save Steam: <strong style="color:#4ade80;">Sinkron dengan Versi #${localSave.matched_index}</strong></span><span>${formatUnixTime(localSave.mtime)}</span>`;
+            banner.innerHTML = `<span>Folder Save Lokal: <strong style="color:#4ade80;">Sinkron dengan Versi #${localSave.matched_index}</strong></span><span>${formatUnixTime(localSave.mtime)}</span>`;
           } else {
-            banner.innerHTML = `<span>Folder Save Steam: <strong style="color:var(--text-main);">Save Lokal Berbeda / Belum Di-upload</strong></span><span>${formatUnixTime(localSave.mtime)}</span>`;
+            banner.innerHTML = `<span>Folder Save Lokal: <strong style="color:var(--text-main);">Save Lokal Berbeda / Belum Di-upload</strong></span><span>${formatUnixTime(localSave.mtime)}</span>`;
           }
         }
 
@@ -2262,7 +2562,7 @@
     function renderAchievementList() {
       const box = document.getElementById("achListBox");
       if (!currentAchList || currentAchList.length === 0) {
-        box.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:12.5px;">Data schema achievement belum ditemukan di cache Steam lokal.<br/>Jalankan game ini minimal satu kali di Steam agar daftar achievement terunduh.</div>`;
+        box.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:12.5px;">Game ini tidak memiliki daftar achievement di Steam, atau koneksi internet sedang offline saat pertama kali memuat schema.</div>`;
         return;
       }
       const filtered = currentAchList.filter(item => {
@@ -2453,9 +2753,198 @@
       }
     }
 
+    function openLocalGameModal(editAppId = "") {
+      const aid = String(editAppId || "").trim();
+      const existing = aid ? appState.games.find(x => String(x.appid) === aid && x.is_local) : null;
+
+      document.getElementById("localOldAppIdInput").value = existing ? aid : "";
+      document.getElementById("localExeInput").value = existing ? (existing.exe_path || existing.install_dir || "") : "";
+      document.getElementById("localAppIdInput").value = existing ? existing.appid : "";
+      document.getElementById("localNameInput").value = existing ? existing.name : "";
+      document.getElementById("localSaveDirInput").value = existing ? (existing.save_dir || "") : "";
+      document.getElementById("localGameModalTitle").textContent = existing
+        ? `Pengaturan Game Lokal: ${existing.name}`
+        : "Tambah Game Lokal (Non-Steam)";
+      document.getElementById("btnRemoveLocalGame").style.display = existing ? "inline-flex" : "none";
+
+      const banner = document.getElementById("localDetectBanner");
+      if (banner) {
+        if (existing) {
+          banner.style.display = "block";
+          banner.innerHTML = `✓ Terdaftar sebagai <strong>${existing.name}</strong> (AppID <strong>${existing.appid}</strong> • Emulator: <strong>${existing.emu_type || "Lokal"}</strong> • 🏆 ${existing.ach_total || 0} Achievement)`;
+        } else {
+          banner.style.display = "none";
+          banner.innerHTML = "";
+        }
+      }
+      document.getElementById("localGameModal").classList.add("show");
+    }
+
+    function closeLocalGameModal() {
+      document.getElementById("localGameModal").classList.remove("show");
+    }
+
+    async function pickLocalExe() {
+      const curPath = document.getElementById("localExeInput").value.trim();
+      try {
+        const res = await fetch("/api/pick_local_file", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ initial_dir: curPath })
+        });
+        const data = await res.json();
+        if (data && data.path) {
+          document.getElementById("localExeInput").value = data.path;
+          await detectLocalGameInfo(false);
+        }
+      } catch (e) {
+        showToast("Gagal membuka dialog pilih file.");
+      }
+    }
+
+    async function pickLocalSaveFolder() {
+      try {
+        const res = await fetch("/api/pick_local_folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: "Pilih Folder Save Game Lokal" })
+        });
+        const data = await res.json();
+        if (data && data.path) {
+          document.getElementById("localSaveDirInput").value = data.path;
+        }
+      } catch (e) {
+        showToast("Gagal membuka dialog pilih folder.");
+      }
+    }
+
+    async function detectLocalGameInfo(forceRefreshName = false) {
+      const pathVal = document.getElementById("localExeInput").value.trim();
+      const appIdVal = document.getElementById("localAppIdInput").value.trim();
+      if (!pathVal && !appIdVal) return;
+
+      const banner = document.getElementById("localDetectBanner");
+      if (banner) {
+        banner.style.display = "block";
+        banner.innerHTML = "⏳ Mendeteksi AppID, daftar Achievement Steam, dan lokasi Save Game...";
+      }
+
+      try {
+        const res = await fetch("/api/detect_local_game", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: pathVal, appid_or_url: appIdVal })
+        });
+        const data = await res.json();
+        if (!data || !data.ok) return;
+
+        if (data.exe_path) {
+          document.getElementById("localExeInput").value = data.exe_path;
+        }
+        if (data.appid && (!appIdVal || forceRefreshName)) {
+          document.getElementById("localAppIdInput").value = data.appid;
+        }
+        const curName = document.getElementById("localNameInput").value.trim();
+        if (data.name && (!curName || forceRefreshName)) {
+          document.getElementById("localNameInput").value = data.name;
+        }
+        const curSave = document.getElementById("localSaveDirInput").value.trim();
+        if (data.save_dir && (!curSave || forceRefreshName)) {
+          document.getElementById("localSaveDirInput").value = data.save_dir;
+        }
+
+        if (banner) {
+          if (data.appid) {
+            banner.innerHTML = `✓ Terdeteksi: <strong style="color:#4ade80;">${data.name || 'Game'}</strong> • AppID: <strong>${data.appid}</strong> • Emulator: <strong>${data.emu_type || 'Lokal'}</strong> • 🏆 <strong>${data.ach_total || 0} Achievement Resmi Steam</strong>`;
+          } else {
+            banner.innerHTML = `⚠️ File .exe ditemukan, namun AppID belum terdeteksi otomatis. Silakan tempel Link Steam Store game ini di kolom AppID.`;
+          }
+        }
+      } catch (e) {
+        if (banner) {
+          banner.innerHTML = "Gagal mendeteksi info game secara otomatis.";
+        }
+      }
+    }
+
+    async function submitLocalGame() {
+      const exe_path = document.getElementById("localExeInput").value.trim();
+      const appid_or_url = document.getElementById("localAppIdInput").value.trim();
+      const name = document.getElementById("localNameInput").value.trim();
+      const save_dir = document.getElementById("localSaveDirInput").value.trim();
+      const old_appid = document.getElementById("localOldAppIdInput").value.trim();
+
+      if (!exe_path) {
+        showToast("Pilih file .exe atau masukkan folder game terlebih dahulu!");
+        return;
+      }
+
+      const btn = document.getElementById("btnSaveLocalGame");
+      if (btn) btn.disabled = true;
+      showToast("Menyimpan game lokal & mengunduh daftar Achievement Steam...", 6000);
+
+      try {
+        const res = await fetch("/api/save_local_game", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ exe_path, appid_or_url, name, save_dir, old_appid })
+        });
+        const data = await res.json();
+        showToast(data.message || (data.ok ? "Game lokal disimpan!" : "Gagal menyimpan game lokal."), 4500);
+        if (data && data.ok) {
+          closeLocalGameModal();
+          await refreshState();
+          if (data.appid) {
+            openGamePage(String(data.appid));
+          }
+        }
+      } catch (e) {
+        showToast("Gagal menghubungi server lokal.");
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function removeLocalGameNow() {
+      const old_appid = document.getElementById("localOldAppIdInput").value.trim() || document.getElementById("localAppIdInput").value.trim();
+      if (!old_appid) return;
+      try {
+        const res = await fetch("/api/remove_local_game", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: old_appid })
+        });
+        const data = await res.json();
+        showToast(data.message || "Dihapus dari daftar.", 3500);
+        closeLocalGameModal();
+        if (activeGamePageAppId === String(old_appid)) {
+          closeGamePage();
+        }
+        await refreshState();
+      } catch (e) {
+        showToast("Gagal menghapus game dari daftar.");
+      }
+    }
+
+    async function openLocalFolder(appid, kind = "game") {
+      try {
+        const res = await fetch("/api/open_local_folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ appid: String(appid), kind })
+        });
+        const data = await res.json();
+        if (data && !data.ok && data.message) {
+          showToast(data.message);
+        }
+      } catch (e) {
+        showToast("Gagal membuka folder.");
+      }
+    }
+
     // Synchronous instant render on Frame 1 (Zero blink / Zero network wait)
     updateThemeBtnLabel(document.documentElement.getAttribute("data-theme") || "dark");
-    if (appState && appState.accounts && appState.accounts.length > 0) {
+    if (appState && ((appState.accounts && appState.accounts.length > 0) || (appState.games && appState.games.length > 0))) {
       applyState(appState);
     } else {
       refreshState();
